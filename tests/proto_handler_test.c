@@ -17,6 +17,7 @@
  *   NANOPB=/home/juanignaciolorca/ncs/v2.7.0/modules/lib/nanopb
  *   GEN=/home/juanignaciolorca/Desktop/Personal-AI-Studio/Descentralized_Mesh_Noric_GATT_Server/firmware/build
  *   SRC=/home/juanignaciolorca/Desktop/Personal-AI-Studio/Descentralized_Mesh_Noric_GATT_Server/firmware/src
+ *   TESTS=/home/juanignaciolorca/Desktop/Personal-AI-Studio/Descentralized_Mesh_Noric_GATT_Server/firmware/tests
  *
  *   # 1. shim so <zephyr/logging/log.h> resolves on the host:
  *   mkdir -p /tmp/ph_shim/zephyr/logging
@@ -28,7 +29,7 @@
  *   #    we link ALL of $GEN/meshtastic/*.pb.c, not just mesh.pb.c.
  *   gcc -std=c11 -Wall -Wextra -DPB_FIELD_32BIT \
  *       -I/tmp/ph_shim -I"$NANOPB" -I"$GEN" -I"$SRC" \
- *       "$SRC/proto_handler_test.c" \
+ *       "$TESTS/proto_handler_test.c" \
  *       "$SRC/proto_handler.c" \
  *       "$GEN"/meshtastic/*.pb.c \
  *       "$NANOPB/pb_common.c" "$NANOPB/pb_encode.c" "$NANOPB/pb_decode.c" \
