@@ -16,6 +16,24 @@
 /* Max size of a single FromRadio protobuf packet (bytes) */
 #define FROMRADIO_MAX_PKT_SIZE  512
 
+/*
+ * Per-phone config-session state (ADR-001, per-phone state machine).
+ *
+ *   CONNECTED          → just connected (CCCD not yet subscribed)
+ *   AWAIT_WANT_CONFIG  → subscribed, waiting for the phone's want_config
+ *   PENDING            → asked for config before the cache was ready; queued in
+ *                        upstream_session and served once CACHE_READY
+ *   REPLAYING          → mid burst replay (cursor walking the shared cache)
+ *   ACTIVE             → burst replayed + config_complete sent; live traffic
+ */
+enum phone_state {
+    PHONE_CONNECTED,
+    PHONE_AWAIT_WANT_CONFIG,
+    PHONE_PENDING,
+    PHONE_REPLAYING,
+    PHONE_ACTIVE,
+};
+
 /**
  * Callback fired when a connected phone writes to the TORADIO characteristic.
  *
@@ -69,5 +87,26 @@ struct bt_conn *ble_gatt_get_conn_by_proxy_id(const proxy_id_t *id);
  * @return 0 on success, -ENOENT if connection is not tracked.
  */
 int ble_gatt_register_proxy_id(struct bt_conn *conn, const proxy_id_t *id);
+
+/*
+ * Replay the boot-populated config cache to a single phone, then close the
+ * burst with a synthesized FromRadio{config_complete_id = nonce} carrying THAT
+ * phone's nonce (ADR-001 per-phone replay).
+ *
+ * Frames are read straight from the shared config_cache arena via a cursor and
+ * enqueued one by one — the whole burst is never copied into the per-conn queue
+ * as a block (avoids N× RAM duplication). On completion the phone goes ACTIVE.
+ *
+ * Called from on_toradio_ble (cache already ready) and registered with
+ * upstream_session as the serve callback for PENDING phones.
+ */
+void ble_gatt_replay_cached_burst(struct bt_conn *conn, uint32_t nonce);
+
+/*
+ * Park a phone as PENDING: it asked for config before the cache was ready.
+ * Records the phone's nonce and registers it with upstream_session, which
+ * replays the burst (via the serve callback) once CACHE_READY.
+ */
+void ble_gatt_park_pending(struct bt_conn *conn, uint32_t nonce);
 
 #endif /* BLE_GATT_H */

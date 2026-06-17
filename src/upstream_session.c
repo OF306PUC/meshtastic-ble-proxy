@@ -62,6 +62,11 @@ static uint32_t            s_nonce;
 static struct bt_conn *s_pending[CONFIG_BT_MAX_CONN];
 static uint8_t         s_pending_count;
 
+/* Per-phone replay callback (dependency inversion — see upstream_session.h).
+ * main registers ble_gatt_replay_cached_burst here at boot; we keep NO direct
+ * ble_gatt dependency. */
+static void (*s_serve_cb)(struct bt_conn *conn, uint32_t nonce);
+
 /* -------------------------------------------------------------------------
  * Phase 0 per-variant accumulators (bytes + counts). Reset in cache_begin
  * path (upstream_session_start) and dumped at mark_ready.
@@ -163,8 +168,6 @@ static void log_phase0_breakdown(void)
     }
     LOG_INF("  config_complete_id: %u", (unsigned)s_p0.config_complete_id);
     LOG_INF("  TOTAL: %u B", (unsigned)s_p0.total_bytes);
-    LOG_INF("Phase 0: burst measured. Set CONFIG_CACHE_ARENA_BYTES >= %u. "
-            "Update ADR-001.", (unsigned)s_p0.total_bytes);
 }
 
 /* -------------------------------------------------------------------------
@@ -173,13 +176,17 @@ static void log_phase0_breakdown(void)
 static void serve_one_pending(struct bt_conn *conn)
 {
     /*
-     * TODO(Task C): replay the cached burst to `conn` via the per-phone replay
-     * path in ble_gatt (cursor over config_cache, then a synthesized
-     * FromRadio{config_complete_id = that phone's nonce}). Stubbed here so
-     * upstream_session compiles with NO ble_gatt dependency.
+     * Replay the cached burst to `conn` via the registered per-phone replay
+     * callback (ble_gatt_replay_cached_burst). nonce = 0 tells ble_gatt to use
+     * the phone's nonce it stored in ble_gatt_park_pending() — upstream tracks
+     * only the conn, not the nonce, so this module keeps NO ble_gatt dependency.
      */
-    ARG_UNUSED(conn);
-    LOG_DBG("serve_one_pending: stub (Task C wires ble_gatt replay)");
+    if (s_serve_cb == NULL) {
+        LOG_ERR("serve_one_pending: no serve callback registered — phone %p stuck",
+                (void *)conn);
+        return;
+    }
+    s_serve_cb(conn, 0);
 }
 
 static void serve_pending_phones(void)
@@ -270,6 +277,11 @@ enum upstream_state upstream_get_state(void)
     return s_state;
 }
 
+void upstream_set_serve_cb(void (*cb)(struct bt_conn *conn, uint32_t nonce))
+{
+    s_serve_cb = cb;
+}
+
 bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
                            const struct fromradio_info *info)
 {
@@ -310,10 +322,11 @@ bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
             return true;
         }
 
-        /* Ours: cache it (part of the replayed burst order), record for the
-         * Phase 0 log, publish the cache and go LIVE. */
+        /* Ours: this frame is the TERMINATOR, not replayable content. Do NOT
+         * cache it — the per-phone replay synthesizes its own config_complete_id
+         * carrying THAT phone's nonce (caching this one would replay the boot
+         * nonce to phones). We still account it for the Phase 0 byte total. */
         phase0_account(info->which_variant, len);
-        (void)cache_add_frame(payload, len, info->which_variant);
         s_p0.config_complete_id = got_nonce;
 
         cache_mark_ready();

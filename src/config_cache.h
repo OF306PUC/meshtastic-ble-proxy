@@ -40,7 +40,7 @@
 /* Default arena size — 16 KB. ADR-001 RAM budget sizes this from the real
  * node's Phase 0 boot measurement; upstream_session logs the observed total.
  * Update this define (and ADR-001) once Phase 0 has been measured. */
-#define CONFIG_CACHE_ARENA_BYTES 16384  /* 16 KB default; update after Phase 0 measurement */
+#define CONFIG_CACHE_ARENA_BYTES 4096  /* 16 KB default; update after Phase 0 measurement */
 
 /* Max number of frames the index can hold. node_info dominates the count
  * (one frame per mesh node). */
@@ -86,8 +86,42 @@ bool cache_is_ready(void);
 /* Return the index entry for frame idx, or NULL if idx is out of range. */
 const struct cache_frame_ref *cache_frame_at(uint16_t idx);
 
+/*
+ * Return a read-only pointer to the raw bytes of the frame described by ref.
+ *
+ * The arena is private to config_cache; per-phone replay (ble_gatt) holds only
+ * a cache_frame_ref (from cache_frame_at) and resolves it to bytes here, so the
+ * replay path reads STRAIGHT FROM THE SHARED ARENA — no per-connection copy of
+ * the burst (ADR-001 RAM budget). The pointer is valid for the cache lifetime
+ * (read-only after cache_mark_ready). Returns NULL if ref is NULL.
+ */
+const uint8_t *cache_frame_bytes(const struct cache_frame_ref *ref);
+
 /* Number of frames currently stored. */
 uint16_t cache_frame_count(void);
+
+/*
+ * Meshtastic special want_config nonces (PhoneAPI). The real phone app fetches
+ * the node in TWO rounds with these sentinel nonces (confirmed against a real
+ * node, .tmp/burst_*.hex, and NimbleBluetooth.cpp). See ADR-001 and memory
+ * meshtastic-want-config-special-nonces.
+ */
+#define MESH_NONCE_ONLY_CONFIG 69420u  /* config + OWN node_info; skip other nodes */
+#define MESH_NONCE_ONLY_NODES  69421u  /* node_info only (own + others)            */
+
+/*
+ * Whether cached frame `idx` should be replayed for a phone that sent `nonce`.
+ *
+ *   MESH_NONCE_ONLY_NODES (69421): only node_info frames.
+ *   MESH_NONCE_ONLY_CONFIG (69420): everything EXCEPT non-first node_info
+ *       (keep the OWN node_info — the first one — drop other-node node_info).
+ *   any other nonce: the full burst (true for every frame).
+ *
+ * A config_complete_id frame is NEVER served from the cache (the replay
+ * synthesizes it per phone), so this returns false for that variant in all
+ * segments. Returns false for out-of-range idx.
+ */
+bool cache_frame_in_segment(uint16_t idx, uint32_t nonce);
 
 /*
  * Fetch the cached queueStatus frame (variant

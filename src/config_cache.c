@@ -47,15 +47,17 @@ static uint16_t               s_used;
 static uint16_t               s_count;
 static atomic_t               s_ready;
 static int                    s_queuestatus_idx = -1;
+static int                    s_own_nodeinfo_idx = -1;  /* first node_info = OWN */
 
 void cache_begin(void)
 {
     /* Reset for a fresh burst. Clear ready FIRST so no reader can observe a
      * stale "ready" while we are mid-rewrite. */
     atomic_set(&s_ready, 0);
-    s_used            = 0;
-    s_count           = 0;
-    s_queuestatus_idx = -1;
+    s_used             = 0;
+    s_count            = 0;
+    s_queuestatus_idx  = -1;
+    s_own_nodeinfo_idx = -1;
     LOG_INF("cache_begin: arena=%u B, max_frames=%u",
             (unsigned)CONFIG_CACHE_ARENA_BYTES,
             (unsigned)CONFIG_CACHE_MAX_FRAMES);
@@ -94,6 +96,13 @@ int cache_add_frame(const uint8_t *raw, uint16_t len, int variant)
         s_queuestatus_idx = (int)s_count;
     }
 
+    /* Remember the FIRST node_info: it is the node's OWN NodeInfo (the burst
+     * always sends own node_info before the other-node node_infos). Used to
+     * segment replays for the special want_config nonces. */
+    if (variant == meshtastic_FromRadio_node_info_tag && s_own_nodeinfo_idx < 0) {
+        s_own_nodeinfo_idx = (int)s_count;
+    }
+
     LOG_DBG("cache_add_frame: idx=%u variant=%d len=%u (used=%u B)",
             (unsigned)s_count, variant, (unsigned)len,
             (unsigned)(s_used + len));
@@ -125,6 +134,14 @@ const struct cache_frame_ref *cache_frame_at(uint16_t idx)
     return &s_index[idx];
 }
 
+const uint8_t *cache_frame_bytes(const struct cache_frame_ref *ref)
+{
+    if (ref == NULL) {
+        return NULL;
+    }
+    return &s_arena[ref->offset];
+}
+
 uint16_t cache_frame_count(void)
 {
     return s_count;
@@ -138,5 +155,39 @@ bool cache_get_queuestatus(const uint8_t **out_buf, uint16_t *out_len)
     const struct cache_frame_ref *ref = &s_index[s_queuestatus_idx];
     *out_buf = &s_arena[ref->offset];
     *out_len = ref->len;
+    return true;
+}
+
+bool cache_frame_in_segment(uint16_t idx, uint32_t nonce)
+{
+    if (idx >= s_count) {
+        return false;
+    }
+
+    int variant = s_index[idx].variant;
+
+    /* config_complete_id is the terminator — synthesized per phone, never
+     * replayed from the cache (would carry the boot nonce). */
+    if (variant == meshtastic_FromRadio_config_complete_id_tag) {
+        return false;
+    }
+
+    bool is_nodeinfo = (variant == meshtastic_FromRadio_node_info_tag);
+
+    if (nonce == MESH_NONCE_ONLY_NODES) {
+        /* ONLY_NODES (69421): node_info frames only (own + others). */
+        return is_nodeinfo;
+    }
+
+    if (nonce == MESH_NONCE_ONLY_CONFIG) {
+        /* ONLY_CONFIG (69420): everything except other-node node_info; keep the
+         * OWN node_info (the first one). */
+        if (is_nodeinfo && (int)idx != s_own_nodeinfo_idx) {
+            return false;
+        }
+        return true;
+    }
+
+    /* Normal nonce: replay the full burst. */
     return true;
 }

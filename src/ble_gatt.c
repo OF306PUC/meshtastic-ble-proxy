@@ -33,6 +33,9 @@
  */
 
 #include "ble_gatt.h"
+#include "config_cache.h"
+#include "proto_handler.h"
+#include "upstream_session.h"
 
 #include <string.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -81,6 +84,13 @@ struct proxy_conn {
     proxy_id_t       proxy_id;       /* Phone identifier registered via NODE_REG    */
     uint32_t         fromnum;        /* Monotonically incrementing packet counter   */
 
+    /* Per-phone config-session state (ADR-001) */
+    enum phone_state state;          /* CONNECTED → … → ACTIVE                       */
+    uint32_t         nonce;          /* This phone's want_config nonce               */
+    uint16_t         replay_cursor;  /* Next cache frame index to replay             */
+    uint8_t          cc_frame[16];   /* Pre-encoded config_complete_id (served last) */
+    uint8_t          cc_len;         /* Length of cc_frame; 0 until replay armed      */
+
     /* Circular queue of outbound FromRadio packets */
     struct pkt_entry queue[FROMRADIO_QUEUE_DEPTH];
     uint8_t          head;
@@ -114,13 +124,16 @@ static struct proxy_conn *alloc_slot(struct bt_conn *conn)
 {
     for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
         if (conns[i].conn == NULL) {
-            conns[i].conn       = bt_conn_ref(conn);
+            conns[i].conn          = bt_conn_ref(conn);
             memset(&conns[i].proxy_id, 0, sizeof(proxy_id_t));
-            conns[i].fromnum    = 0;
-            conns[i].head       = 0;
-            conns[i].tail       = 0;
-            conns[i].count      = 0;
-            conns[i].staged_len = 0;
+            conns[i].fromnum       = 0;
+            conns[i].head          = 0;
+            conns[i].tail          = 0;
+            conns[i].count         = 0;
+            conns[i].staged_len    = 0;
+            conns[i].state         = PHONE_CONNECTED;
+            conns[i].nonce         = 0;
+            conns[i].replay_cursor = 0;
             return &conns[i];
         }
     }
@@ -134,11 +147,14 @@ static void free_slot(struct proxy_conn *pc)
         pc->conn = NULL;
     }
     memset(&pc->proxy_id, 0, sizeof(proxy_id_t));
-    pc->fromnum    = 0;
-    pc->head       = 0;
-    pc->tail       = 0;
-    pc->count      = 0;
-    pc->staged_len = 0;
+    pc->fromnum       = 0;
+    pc->head          = 0;
+    pc->tail          = 0;
+    pc->count         = 0;
+    pc->staged_len    = 0;
+    pc->state         = PHONE_CONNECTED;
+    pc->nonce         = 0;
+    pc->replay_cursor = 0;
 }
 
 /* --------------------------------------------------------- GATT callbacks */
@@ -184,8 +200,43 @@ static ssize_t fromradio_read(struct bt_conn *conn, const struct bt_gatt_attr *a
     k_mutex_lock(&pc->lock, K_FOREVER);
 
     if (offset == 0) {
-        /* Fresh read: stage the next queued packet (or mark empty). */
-        if (pc->count > 0) {
+        /* Fresh read: stage the next packet (or mark empty). */
+        if (pc->state == PHONE_REPLAYING) {
+            /*
+             * ADR-001 serve-on-read replay: hand back ONE cached config frame per
+             * ATT read, straight from the shared arena, then the synthesized
+             * config_complete_id, then go ACTIVE. This keeps RAM at O(1) per conn
+             * (no pre-enqueue of a dozens-of-frames burst into the 8-deep queue).
+             */
+            uint16_t n = cache_frame_count();
+            /* Skip cached frames that are not in this phone's nonce segment
+             * (69420 ONLY_CONFIG / 69421 ONLY_NODES subsets; config_complete is
+             * always skipped here and synthesized below). */
+            while (pc->replay_cursor < n &&
+                   !cache_frame_in_segment(pc->replay_cursor, pc->nonce)) {
+                pc->replay_cursor++;
+            }
+            if (pc->replay_cursor < n) {
+                const struct cache_frame_ref *ref = cache_frame_at(pc->replay_cursor);
+                if (ref) {
+                    memcpy(pc->staged, cache_frame_bytes(ref), ref->len);
+                    pc->staged_len = ref->len;
+                } else {
+                    pc->staged_len = 0;
+                }
+                pc->replay_cursor++;
+            } else if (pc->replay_cursor == n) {
+                /* All cache frames served — emit config_complete_id last. */
+                memcpy(pc->staged, pc->cc_frame, pc->cc_len);
+                pc->staged_len = pc->cc_len;
+                pc->replay_cursor++;
+            } else {
+                /* Burst fully drained — go live and report empty. */
+                pc->state      = PHONE_ACTIVE;
+                pc->staged_len = 0;
+                LOG_INF("replay drained → conn %p ACTIVE", (void *)conn);
+            }
+        } else if (pc->count > 0) {
             struct pkt_entry *pkt = &pc->queue[pc->head];
             memcpy(pc->staged, pkt->data, pkt->len);
             pc->staged_len = pkt->len;
@@ -464,4 +515,77 @@ int ble_gatt_broadcast_fromradio(const uint8_t *data, uint16_t len)
         }
     }
     return sent;  /* number of connections that received the packet */
+}
+
+/* ------------------------------------------------ Per-phone config replay */
+
+void ble_gatt_replay_cached_burst(struct bt_conn *conn, uint32_t nonce)
+{
+    struct proxy_conn *pc = find_slot(conn);
+    if (!pc) {
+        LOG_WRN("replay: conn %p not tracked", (void *)conn);
+        return;
+    }
+
+    /*
+     * Two entry paths share this function (ADR-001):
+     *   - cache already ready: on_toradio_ble calls with the phone's live nonce.
+     *   - PENDING served later: upstream's serve callback fires here; the phone's
+     *     nonce was stored by ble_gatt_park_pending() (upstream tracks only conn,
+     *     not the nonce). A passed nonce of 0 means "use the stored one".
+     */
+    if (nonce != 0) {
+        pc->nonce = nonce;
+    }
+    nonce = pc->nonce;
+
+    /*
+     * ADR-001 serve-on-read replay. We do NOT pre-enqueue the burst: a real
+     * want_config burst is dozens of frames and would overflow the 8-deep
+     * per-conn queue (frames 9+ would be dropped mid-handshake). Instead we
+     * pre-encode the trailing config_complete_id once, arm a cursor, and let
+     * fromradio_read() serve one cached frame per ATT read straight from the
+     * shared arena. The phone drains FROMRADIO until an empty reply, so a
+     * single FROMNUM kick walks the entire virtual burst with O(1) RAM here.
+     */
+    uint16_t cc_len = 0;
+    int enc = proto_encode_config_complete(nonce, pc->cc_frame, sizeof(pc->cc_frame),
+                                           &cc_len);
+    if (enc != 0) {
+        LOG_ERR("replay: config_complete encode failed: %d — replay aborted", enc);
+        return;
+    }
+
+    k_mutex_lock(&pc->lock, K_FOREVER);
+    pc->cc_len        = (uint8_t)cc_len;
+    pc->replay_cursor = 0;
+    pc->state         = PHONE_REPLAYING;
+    pc->fromnum++;
+    uint32_t fromnum_val = pc->fromnum;
+    k_mutex_unlock(&pc->lock);
+
+    /* Kick the phone to start its FROMRADIO drain loop. */
+    int nerr = bt_gatt_notify(conn, &meshtastic_svc.attrs[FROMNUM_ATTR_IDX],
+                              &fromnum_val, sizeof(fromnum_val));
+    if (nerr) {
+        LOG_WRN("replay: FROMNUM kick failed: %d", nerr);
+    }
+
+    LOG_INF("replay armed: %u cache frames + config_complete (nonce=%u) → conn %p",
+            cache_frame_count(), (unsigned)nonce, (void *)conn);
+}
+
+void ble_gatt_park_pending(struct bt_conn *conn, uint32_t nonce)
+{
+    struct proxy_conn *pc = find_slot(conn);
+    if (!pc) {
+        LOG_WRN("park_pending: conn %p not tracked", (void *)conn);
+        return;
+    }
+
+    pc->state = PHONE_PENDING;
+    pc->nonce = nonce;
+    upstream_on_pending_phone(conn);
+    LOG_INF("park_pending: conn %p queued (nonce=%u) until cache ready",
+            (void *)conn, (unsigned)nonce);
 }

@@ -29,6 +29,7 @@
 #include "router.h"
 #include "ble_gatt.h"
 #include "proxy_protocol.h"
+#include "upstream_session.h"
 
 #include "meshtastic/mesh.pb.h"   /* meshtastic_FromRadio_packet_tag */
 #include <zephyr/logging/log.h>
@@ -38,6 +39,20 @@ LOG_MODULE_REGISTER(router, LOG_LEVEL_DBG);
 void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
                      const struct fromradio_info *info)
 {
+    /* ----------------------------------------------------------------
+     * Upstream config-fetch window (ADR-001): while the proxy is consuming its
+     * own boot config burst, config/meta variants are CONSUMED into the cache
+     * (not broadcast). upstream_on_fromradio returns true when it took the frame.
+     * Packet variants are NOT consumed (returns false) → fall through so live
+     * mesh traffic still reaches the phones during the fetch.
+     * ---------------------------------------------------------------- */
+    if (upstream_get_state() == UPSTREAM_FETCHING) {
+        if (upstream_on_fromradio(raw_bytes, len, info)) {
+            return;
+        }
+        /* else: packet variant — fall through to the normal broadcast path. */
+    }
+
     /* ----------------------------------------------------------------
      * Tier 1: non-packet FromRadio variant → broadcast unconditionally
      * ---------------------------------------------------------------- */

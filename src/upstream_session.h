@@ -48,6 +48,19 @@ void upstream_session_start(void);
 enum upstream_state upstream_get_state(void);
 
 /*
+ * Register the per-phone replay callback (dependency inversion).
+ *
+ * upstream_session must serve PENDING phones once the cache is ready, but it has
+ * NO dependency on ble_gatt (ADR-001 — no layering inversion). main wires
+ * ble_gatt_replay_cached_burst here at boot; serve_one_pending() invokes it.
+ *
+ * @param cb  called as cb(conn, nonce). upstream passes nonce = 0, meaning
+ *            "use the phone's nonce stored by ble_gatt_park_pending" (upstream
+ *            tracks only the conn, not the nonce).
+ */
+void upstream_set_serve_cb(void (*cb)(struct bt_conn *conn, uint32_t nonce));
+
+/*
  * Feed one decoded FromRadio frame to the upstream state machine.
  *
  * @param payload  raw FromRadio protobuf bytes (no serial header).

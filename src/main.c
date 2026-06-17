@@ -5,6 +5,7 @@
 #include "uart_meshtastic.h"
 #include "proto_handler.h"
 #include "router.h"
+#include "upstream_session.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -34,13 +35,54 @@ static void on_fromradio_uart(const uint8_t *payload, uint16_t len)
 
 /*
  * Called when a phone writes a ToRadio protobuf to the GATT TORADIO
- * characteristic. The bytes are already protobuf-encoded by the phone's app;
- * we add the Meshtastic UART framing and push to the TX queue.
+ * characteristic (ADR-001 per-phone config-session virtualization).
+ *
+ * The proxy is NO LONGER a blind passthrough:
+ *   - want_config_id : served LOCALLY from the cache (replay or PENDING).
+ *                      NEVER forwarded to UART — forwarding it would restart the
+ *                      node's single global config session and clobber every
+ *                      other phone's in-flight handshake.
+ *   - heartbeat      : swallowed locally (Task D adds the reactive queueStatus
+ *                      reply later). NEVER forwarded to UART.
+ *   - anything else  : a real packet → forwarded to the node via UART as today.
+ *
+ * On decode failure we forward the raw bytes best-effort (no silent drop).
  */
 static void on_toradio_ble(struct bt_conn *conn, const uint8_t *data, uint16_t len)
 {
-    LOG_INF("ToRadio: %d bytes from conn %p → UART", len, (void *)conn);
+    struct toradio_info ti;
 
+    if (proto_decode_toradio(data, len, &ti) != 0) {
+        /* Malformed ToRadio — forward best-effort so nothing is silently lost. */
+        LOG_WRN("ToRadio decode failed (%d B) from conn %p — forwarding raw",
+                len, (void *)conn);
+        (void)uart_meshtastic_tx(data, len);
+        return;
+    }
+
+    if (ti.has_want_config) {
+        /* Serve config locally: replay if the cache is ready, else PENDING. */
+        enum upstream_state st = upstream_get_state();
+        if (st == UPSTREAM_CACHE_READY || st == UPSTREAM_LIVE) {
+            LOG_INF("want_config nonce=%u from conn %p → replay cached burst",
+                    (unsigned)ti.want_config_id, (void *)conn);
+            ble_gatt_replay_cached_burst(conn, ti.want_config_id);
+        } else {
+            LOG_INF("want_config nonce=%u from conn %p → PENDING (cache not ready)",
+                    (unsigned)ti.want_config_id, (void *)conn);
+            ble_gatt_park_pending(conn, ti.want_config_id);
+        }
+        return;  /* NEVER forward want_config to UART. */
+    }
+
+    if (ti.has_heartbeat) {
+        /* Absorbed locally. Task D will add the reactive queueStatus reply. */
+        LOG_DBG("heartbeat from conn %p — swallowed (Task D)", (void *)conn);
+        return;  /* NEVER forward heartbeat to UART. */
+    }
+
+    /* Real packet → forward to the node as today. */
+    LOG_INF("ToRadio: %d bytes from conn %p → UART", len, (void *)conn);
     int err = uart_meshtastic_tx(data, len);
     if (err == -ENOMEM) {
         LOG_WRN("TX queue full — ToRadio from conn %p dropped", (void *)conn);
@@ -77,13 +119,24 @@ int main(void)
     }
 
     /* 4. Init UART driver — starts DMA reception immediately.
-     *    The Meshtastic node will begin sending FromRadio frames
-     *    once it receives a want_config_id ToRadio (sent by the phone). */
+     *    The Meshtastic node begins sending FromRadio frames once it receives
+     *    the proxy's own want_config_id ToRadio (sent by upstream_session_start
+     *    below), not a phone's — phones are served from the cache (ADR-001). */
     err = uart_meshtastic_init(on_fromradio_uart);
     if (err) {
         LOG_ERR("uart_meshtastic_init: %d", err);
         return err;
     }
+
+    /* 5. Wire the per-phone replay callback BEFORE starting the upstream fetch,
+     *    so any PENDING phone queued during FETCHING is served the instant the
+     *    cache becomes ready (dependency inversion — ADR-001). */
+    upstream_set_serve_cb(ble_gatt_replay_cached_burst);
+
+    /* 6. Kick off the proxy's own boot want_config: fetch the node's config
+     *    burst into the cache, then go LIVE. Phones connecting before the cache
+     *    is ready are parked PENDING and replayed once ready. */
+    upstream_session_start();
 
     /* Main loop — all work runs in the system work queue and BT callbacks. */
     while (1) {
