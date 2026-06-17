@@ -109,4 +109,14 @@ void ble_gatt_replay_cached_burst(struct bt_conn *conn, uint32_t nonce);
  */
 void ble_gatt_park_pending(struct bt_conn *conn, uint32_t nonce);
 
+/*
+ * Task D — reactive BLE liveness reply. Enqueue a synthesized FromRadio{
+ * queueStatus} to this connection (bumps fromnum + notifies FROMNUM) in
+ * response to the phone's ToRadio.heartbeat. The phone reads it as "radio
+ * data", keeping its app-layer liveness timer from tripping. Absorbed locally
+ * — the heartbeat is NEVER forwarded to UART. The queueStatus is encoded once
+ * and reused.
+ */
+void ble_gatt_reply_queuestatus(struct bt_conn *conn);
+
 #endif /* BLE_GATT_H */

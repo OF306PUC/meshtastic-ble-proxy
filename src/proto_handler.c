@@ -148,3 +148,56 @@ int proto_encode_config_complete(uint32_t nonce, uint8_t *out_buf,
 
     return 0;
 }
+
+int proto_encode_heartbeat(uint32_t nonce, uint8_t *out_buf,
+                           uint16_t buf_size, uint16_t *out_len)
+{
+    /* ToRadio{ heartbeat = { nonce } } via nanopb — no hand-written bytes. */
+    meshtastic_ToRadio tr = meshtastic_ToRadio_init_zero;
+    tr.which_payload_variant = meshtastic_ToRadio_heartbeat_tag;
+    tr.heartbeat.nonce       = nonce;
+
+    pb_ostream_t stream = pb_ostream_from_buffer(out_buf, buf_size);
+    if (!pb_encode(&stream, meshtastic_ToRadio_fields, &tr)) {
+        if (stream.bytes_written >= buf_size) {
+            LOG_WRN("heartbeat encode: buffer too small (%u B)", buf_size);
+            return -ENOMEM;
+        }
+        LOG_WRN("heartbeat pb_encode: %s", PB_GET_ERROR(&stream));
+        return -EINVAL;
+    }
+
+    *out_len = (uint16_t)stream.bytes_written;
+    LOG_DBG("heartbeat encoded nonce=%u -> %u B", nonce, *out_len);
+
+    return 0;
+}
+
+int proto_encode_queue_status(uint8_t *out_buf, uint16_t buf_size,
+                              uint16_t *out_len)
+{
+    /* FromRadio{ queueStatus } via nanopb. Benign, well-formed values: success
+     * (res=0), some free/maxlen capacity, no specific mesh_packet_id. Only used
+     * for BLE heartbeat liveness — the phone just needs valid radio data. */
+    meshtastic_FromRadio fr = meshtastic_FromRadio_init_zero;
+    fr.which_payload_variant      = meshtastic_FromRadio_queueStatus_tag;
+    fr.queueStatus.res            = 0;
+    fr.queueStatus.free           = 16;
+    fr.queueStatus.maxlen         = 16;
+    fr.queueStatus.mesh_packet_id = 0;
+
+    pb_ostream_t stream = pb_ostream_from_buffer(out_buf, buf_size);
+    if (!pb_encode(&stream, meshtastic_FromRadio_fields, &fr)) {
+        if (stream.bytes_written >= buf_size) {
+            LOG_WRN("queueStatus encode: buffer too small (%u B)", buf_size);
+            return -ENOMEM;
+        }
+        LOG_WRN("queueStatus pb_encode: %s", PB_GET_ERROR(&stream));
+        return -EINVAL;
+    }
+
+    *out_len = (uint16_t)stream.bytes_written;
+    LOG_DBG("queueStatus encoded -> %u B", *out_len);
+
+    return 0;
+}

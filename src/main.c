@@ -76,18 +76,23 @@ static void on_toradio_ble(struct bt_conn *conn, const uint8_t *data, uint16_t l
     }
 
     if (ti.has_heartbeat) {
-        /* Absorbed locally. Task D will add the reactive queueStatus reply. */
-        LOG_DBG("heartbeat from conn %p — swallowed (Task D)", (void *)conn);
-        return;  /* NEVER forward heartbeat to UART. */
+        /* Absorbed locally (Task D): reply a synthesized queueStatus to keep the
+         * phone's liveness timer alive. NEVER forwarded to UART — the node's
+         * serial link is kept alive by upstream_session's own keepalive. */
+        ble_gatt_reply_queuestatus(conn);
+        return;
     }
 
-    /* Real packet → forward to the node as today. */
+    /* Real packet → forward to the node, and push the upstream keepalive out
+     * (Task D): the keepalive only fires after a stretch of true silence. */
     LOG_INF("ToRadio: %d bytes from conn %p → UART", len, (void *)conn);
     int err = uart_meshtastic_tx(data, len);
     if (err == -ENOMEM) {
         LOG_WRN("TX queue full — ToRadio from conn %p dropped", (void *)conn);
     } else if (err) {
         LOG_ERR("uart_meshtastic_tx: %d", err);
+    } else {
+        upstream_keepalive_reschedule();
     }
 }
 

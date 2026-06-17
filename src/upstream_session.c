@@ -37,6 +37,7 @@
 #include "proto_handler.h"
 
 #include <string.h>
+#include <zephyr/kernel.h>        /* k_work_delayable, k_work_reschedule, K_MSEC */
 #include <zephyr/random/random.h>
 #include <zephyr/sys/util.h>      /* ARRAY_SIZE, ARG_UNUSED */
 #include <zephyr/logging/log.h>
@@ -66,6 +67,20 @@ static uint8_t         s_pending_count;
  * main registers ble_gatt_replay_cached_burst here at boot; we keep NO direct
  * ble_gatt dependency. */
 static void (*s_serve_cb)(struct bt_conn *conn, uint32_t nonce);
+
+/* -------------------------------------------------------------------------
+ * Task D — upstream UART keepalive (k_work_delayable, NOT k_timer: a k_timer
+ * callback runs in ISR context and may not touch UART/BLE/mutex; a delayable
+ * work item runs on the system work queue, the same context as everything else
+ * here). Period < the node's 15-min serial timeout. Rescheduled on every real
+ * ToRadio TX, so it only fires after a stretch of true silence.
+ * ------------------------------------------------------------------------- */
+#define UPSTREAM_KEEPALIVE_MS (5 * 60 * 1000)   /* 5 min < 15-min serial timeout */
+
+static struct k_work_delayable s_keepalive_work;
+static bool                    s_keepalive_armed;       /* work inited + scheduled */
+static uint32_t                s_keepalive_nonce = 2;   /* never 0 or 1          */
+static bool                    s_keepalive_pending;     /* awaiting our qStatus  */
 
 /* -------------------------------------------------------------------------
  * Phase 0 per-variant accumulators (bytes + counts). Reset in cache_begin
@@ -231,6 +246,43 @@ static bool decode_config_complete_nonce(const uint8_t *payload, uint16_t len,
 }
 
 /* -------------------------------------------------------------------------
+ * Task D — keepalive work handler. Sends one ToRadio{heartbeat} to refresh the
+ * node's serial-activity timer, then re-arms itself. nonce never 0/1.
+ * ------------------------------------------------------------------------- */
+static void keepalive_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    uint32_t nonce = s_keepalive_nonce++;
+    if (s_keepalive_nonce == 0 || s_keepalive_nonce == 1) {
+        s_keepalive_nonce = 2;   /* wrap guard: never reuse 0/1 */
+    }
+
+    uint8_t  buf[16];   /* ToRadio{heartbeat} is a handful of bytes */
+    uint16_t len = 0;
+    int rc = proto_encode_heartbeat(nonce, buf, sizeof(buf), &len);
+    if (rc == 0) {
+        /* Mark BEFORE tx: the node's queueStatus reply (if any) is ours to
+         * swallow, not to broadcast to phones. */
+        s_keepalive_pending = true;
+        int err = uart_meshtastic_tx(buf, len);
+        if (err != 0) {
+            s_keepalive_pending = false;
+            LOG_WRN("keepalive tx failed: %d", err);
+        } else {
+            /* INF (not DBG): fires only every ~5 min, and it is the line you
+             * watch to confirm the upstream keepalive is alive on hardware. */
+            LOG_INF("upstream keepalive heartbeat nonce=%u (%u B) → UART",
+                    (unsigned)nonce, (unsigned)len);
+        }
+    } else {
+        LOG_WRN("keepalive encode failed: %d", rc);
+    }
+
+    k_work_reschedule(&s_keepalive_work, K_MSEC(UPSTREAM_KEEPALIVE_MS));
+}
+
+/* -------------------------------------------------------------------------
  * Public API.
  * ------------------------------------------------------------------------- */
 void upstream_session_start(void)
@@ -270,6 +322,13 @@ void upstream_session_start(void)
     s_state = UPSTREAM_FETCHING;
     LOG_INF("upstream start: want_config nonce=%u sent (%u B), FETCHING",
             (unsigned)s_nonce, (unsigned)stream.bytes_written);
+
+    /* Arm the UART keepalive (Task D). It fires after UPSTREAM_KEEPALIVE_MS of
+     * silence; every real ToRadio TX pushes it out via
+     * upstream_keepalive_reschedule(). */
+    k_work_init_delayable(&s_keepalive_work, keepalive_work_handler);
+    s_keepalive_armed = true;
+    k_work_reschedule(&s_keepalive_work, K_MSEC(UPSTREAM_KEEPALIVE_MS));
 }
 
 enum upstream_state upstream_get_state(void)
@@ -384,4 +443,29 @@ void upstream_on_pending_phone(struct bt_conn *conn)
     s_pending[s_pending_count++] = conn;
     LOG_INF("phone queued PENDING (%u total) until cache ready",
             (unsigned)s_pending_count);
+}
+
+/* -------------------------------------------------------------------------
+ * Task D — keepalive public hooks.
+ * ------------------------------------------------------------------------- */
+void upstream_keepalive_reschedule(void)
+{
+    /* Guard: the delayable work is only valid after upstream_session_start()
+     * has initialised it. Calling k_work_reschedule on an uninitialised work
+     * item is undefined, so ignore reschedules until armed (a phone packet in
+     * the brief boot window before start() simply doesn't push the timer yet). */
+    if (!s_keepalive_armed) {
+        return;
+    }
+    /* Idempotent: rearms the pending work to the full interval. */
+    k_work_reschedule(&s_keepalive_work, K_MSEC(UPSTREAM_KEEPALIVE_MS));
+}
+
+bool upstream_swallow_live_queuestatus(void)
+{
+    if (s_keepalive_pending) {
+        s_keepalive_pending = false;
+        return true;
+    }
+    return false;
 }

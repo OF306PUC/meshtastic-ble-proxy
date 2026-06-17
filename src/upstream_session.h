@@ -84,4 +84,29 @@ bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
  */
 void upstream_on_pending_phone(struct bt_conn *conn);
 
+/*
+ * Task D — upstream UART keepalive.
+ *
+ * Push the keepalive timer out by the full interval. Called by main on every
+ * real ToRadio packet forwarded to the node, so the keepalive heartbeat only
+ * actually fires after a stretch of true silence (it never adds traffic when
+ * the link is already busy). Idempotent (k_work_reschedule rearms if pending).
+ */
+void upstream_keepalive_reschedule(void);
+
+/*
+ * Task D — keepalive queueStatus swallow.
+ *
+ * The node replies to our keepalive heartbeat with a queueStatus FromRadio.
+ * That reply is for the proxy, not the phones, so router calls this when it
+ * sees a queueStatus while LIVE: if a keepalive reply is outstanding it returns
+ * true (consume the flag) and the caller drops the frame instead of
+ * broadcasting it. Returns false for a genuine queueStatus (e.g. the node's
+ * response to a phone's mesh packet), which is broadcast normally.
+ *
+ * Note: the keepalive only fires after ~5 min of silence, so a phone-packet
+ * queueStatus is essentially never in flight when the flag is set.
+ */
+bool upstream_swallow_live_queuestatus(void);
+
 #endif /* UPSTREAM_SESSION_H */

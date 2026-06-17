@@ -589,3 +589,29 @@ void ble_gatt_park_pending(struct bt_conn *conn, uint32_t nonce)
     LOG_INF("park_pending: conn %p queued (nonce=%u) until cache ready",
             (void *)conn, (unsigned)nonce);
 }
+
+void ble_gatt_reply_queuestatus(struct bt_conn *conn)
+{
+    /* The synthesized queueStatus is constant — encode it once and reuse.
+     * Encoded here (BT RX context) on first use; toradio_write callbacks are
+     * serialized by the BT stack, so the lazy init needs no extra lock. */
+    static uint8_t  s_qs[16];
+    static uint16_t s_qs_len;
+
+    if (s_qs_len == 0) {
+        int rc = proto_encode_queue_status(s_qs, sizeof(s_qs), &s_qs_len);
+        if (rc != 0) {
+            LOG_ERR("synth queueStatus encode failed: %d", rc);
+            s_qs_len = 0;
+            return;
+        }
+    }
+
+    int err = ble_gatt_enqueue_fromradio(conn, s_qs, s_qs_len);
+    if (err) {
+        LOG_WRN("queueStatus reply enqueue failed: %d (conn %p)", err, (void *)conn);
+    } else {
+        LOG_DBG("heartbeat → synth queueStatus (%u B) → conn %p",
+                (unsigned)s_qs_len, (void *)conn);
+    }
+}

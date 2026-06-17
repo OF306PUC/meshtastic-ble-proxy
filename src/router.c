@@ -54,9 +54,17 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
     }
 
     /* ----------------------------------------------------------------
-     * Tier 1: non-packet FromRadio variant → broadcast unconditionally
+     * Tier 1: non-packet FromRadio variant → broadcast unconditionally,
+     * EXCEPT the queueStatus the node sends in reply to our own upstream
+     * keepalive heartbeat (Task D) — that reply is for the proxy, not the
+     * phones, so swallow it instead of broadcasting noise.
      * ---------------------------------------------------------------- */
     if (info->which_variant != meshtastic_FromRadio_packet_tag) {
+        if (info->which_variant == meshtastic_FromRadio_queueStatus_tag &&
+            upstream_swallow_live_queuestatus()) {
+            LOG_DBG("keepalive queueStatus swallowed (not broadcast)");
+            return;
+        }
         LOG_DBG("variant %d (config/meta) → broadcast", info->which_variant);
         ble_gatt_broadcast_fromradio(raw_bytes, len);
         return;

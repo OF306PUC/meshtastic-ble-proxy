@@ -85,4 +85,29 @@ int proto_decode_toradio(const uint8_t *buf, uint16_t len,
 int proto_encode_config_complete(uint32_t nonce, uint8_t *out_buf,
                                  uint16_t buf_size, uint16_t *out_len);
 
+/*
+ * Encode a ToRadio{heartbeat = {nonce}} into out_buf (Task D — upstream UART
+ * keepalive). The proxy sends this to the node to refresh the node's serial
+ * activity timer (15-min timeout) during idle. nonce MUST NOT be 1 (the node
+ * treats nonce==1 specially: it forces a NodeInfo rebroadcast).
+ * Built with nanopb pb_encode.
+ *
+ * @return 0 on success, -ENOMEM if out_buf is too small, -EINVAL on failure.
+ */
+int proto_encode_heartbeat(uint32_t nonce, uint8_t *out_buf,
+                           uint16_t buf_size, uint16_t *out_len);
+
+/*
+ * Encode a synthetic FromRadio{queueStatus} into out_buf (Task D — reactive BLE
+ * liveness reply). The node sends a queueStatus in response to a client
+ * heartbeat, but it is NOT part of the want_config burst (so it is not cached);
+ * the proxy synthesizes a well-formed, benign one (res=0, free/maxlen set,
+ * mesh_packet_id=0) so a phone's heartbeat gets the radio-data reply that keeps
+ * its liveness timer from tripping. Built with nanopb pb_encode.
+ *
+ * @return 0 on success, -ENOMEM if out_buf is too small, -EINVAL on failure.
+ */
+int proto_encode_queue_status(uint8_t *out_buf, uint16_t buf_size,
+                              uint16_t *out_len);
+
 #endif /* PROTO_HANDLER_H */
