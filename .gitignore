@@ -1,1 +1,7 @@
+# Zephyr / west build output
 build*/
+
+# Meshtastic protobuf definitions — provide locally before building (see README:
+# symlink or submodule). Ignored so a machine-specific symlink isn't committed.
+# (If you add proto as a git submodule, use `git submodule add --force proto`.)
+/proto
