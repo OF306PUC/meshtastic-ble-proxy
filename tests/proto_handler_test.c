@@ -178,6 +178,53 @@ static void test_config_complete_buf_too_small(void)
     CHECK(rc == -12 /* -ENOMEM */ || rc != 0, "encode reports failure on tiny buf");
 }
 
+static void test_heartbeat_roundtrip(void)
+{
+    printf("test_heartbeat_roundtrip:\n");
+    const uint32_t nonce = 0x01020304u;
+    uint8_t buf[32];
+    uint16_t len = 0;
+
+    int rc = proto_encode_heartbeat(nonce, buf, sizeof(buf), &len);
+    CHECK(rc == 0, "encode_heartbeat returns 0");
+    CHECK(len > 0, "encoded length > 0");
+
+    meshtastic_ToRadio tr = meshtastic_ToRadio_init_zero;
+    pb_istream_t is = pb_istream_from_buffer(buf, len);
+    bool ok = pb_decode(&is, meshtastic_ToRadio_fields, &tr);
+    CHECK(ok, "toradio re-decode ok");
+    CHECK(tr.which_payload_variant == meshtastic_ToRadio_heartbeat_tag,
+          "variant == heartbeat_tag");
+    CHECK(tr.heartbeat.nonce == nonce, "heartbeat.nonce survives round-trip");
+    /* The keepalive must never emit nonce 1 (node treats it specially). */
+    CHECK(nonce != 1, "test nonce is not the reserved value 1");
+}
+
+static void test_queue_status_roundtrip(void)
+{
+    printf("test_queue_status_roundtrip:\n");
+    uint8_t buf[32];
+    uint16_t len = 0;
+
+    int rc = proto_encode_queue_status(buf, sizeof(buf), &len);
+    CHECK(rc == 0, "encode_queue_status returns 0");
+    CHECK(len > 0, "encoded length > 0");
+
+    struct fromradio_info fr;
+    int drc = proto_decode_fromradio(buf, len, &fr);
+    CHECK(drc == 0, "fromradio decode returns 0");
+    CHECK(fr.which_variant == meshtastic_FromRadio_queueStatus_tag,
+          "variant == queueStatus_tag");
+
+    meshtastic_FromRadio raw = meshtastic_FromRadio_init_zero;
+    pb_istream_t is = pb_istream_from_buffer(buf, len);
+    bool ok = pb_decode(&is, meshtastic_FromRadio_fields, &raw);
+    CHECK(ok, "raw fromradio re-decode ok");
+    CHECK(raw.queueStatus.maxlen == 16, "queueStatus.maxlen == 16");
+    CHECK(raw.queueStatus.free == 16, "queueStatus.free == 16");
+    CHECK(raw.queueStatus.res == 0, "queueStatus.res == 0 (success)");
+}
+
 int main(void)
 {
     printf("=== proto_handler host tests ===\n");
@@ -187,6 +234,8 @@ int main(void)
     test_decode_empty();
     test_config_complete_roundtrip();
     test_config_complete_buf_too_small();
+    test_heartbeat_roundtrip();
+    test_queue_status_roundtrip();
 
     if (g_failures == 0) {
         printf("\nALL TESTS PASSED\n");
