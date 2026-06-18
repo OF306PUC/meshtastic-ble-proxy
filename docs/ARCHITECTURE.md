@@ -1,0 +1,363 @@
+# Architecture — Meshtastic BLE Proxy (nRF52840 / Zephyr)
+
+This document audits the embedded software: module structure, data flow, the two
+state machines, the `want_config` handshake sequence, the threading model, and the
+boot order. Diagrams are Mermaid (render natively on GitHub and in the IDE).
+
+The firmware turns one Meshtastic node into a **6-phone BLE front end**. Each phone
+gets a connection that behaves like a standalone 1:1 Meshtastic link, while the proxy
+arbitrates the single shared UART link to the node.
+
+---
+
+## 1. Module dependency graph
+
+Who calls/includes whom (`src/`). `upstream_session` deliberately has **no** compile
+dependency on `ble_gatt` — the per-phone replay is reached through a registered
+callback (dependency inversion).
+
+```mermaid
+flowchart TD
+    main["main.c<br/>boot order · ToRadio/FromRadio callbacks"]
+    ble["ble_gatt.c<br/>GATT server · per-phone state · replay"]
+    uart["uart_meshtastic.c<br/>UART1 Stream API · TX queue"]
+    router["router.c<br/>FromRadio dispatch"]
+    up["upstream_session.c<br/>boot want_config · state machine · keepalive"]
+    cache["config_cache.c<br/>packed burst cache · segmentation"]
+    proto["proto_handler.c<br/>nanopb decode/encode"]
+    proxyp["proxy_protocol.c<br/>DST_ID header (portnum 256)"]
+
+    main --> ble
+    main --> uart
+    main --> proto
+    main --> router
+    main --> up
+
+    router --> up
+    router --> ble
+    router --> proxyp
+    router --> proto
+
+    ble --> cache
+    ble --> proto
+    ble --> up
+
+    up --> cache
+    up --> uart
+    up --> proto
+
+    up -. "serve callback<br/>(set at boot, no static dep)" .-> ble
+
+    classDef new fill:#cfe8ff,stroke:#2b6cb0,color:#14213d;
+    class cache,up new;
+```
+
+- Pure / leaf modules (no intra-project deps): `proto_handler`, `proxy_protocol`,
+  `uart_meshtastic`, `config_cache`.
+- The dashed edge is the runtime callback `upstream_set_serve_cb(ble_gatt_replay_cached_burst)`
+  registered by `main` at boot — keeps the layering clean (upstream → ble_gatt only at runtime).
+
+---
+
+## 2. Data flow (BLE ↔ UART)
+
+```mermaid
+flowchart LR
+    subgraph Phones["Up to 6 phones (BLE centrals)"]
+        pa["Phone A"]
+        pb["Phone B"]
+        pn["Phone N"]
+    end
+
+    subgraph Proxy["nRF52840 proxy"]
+        gatt["ble_gatt<br/>FROMNUM / FROMRADIO / TORADIO / NODE_REG"]
+        rt["router"]
+        cc["config_cache"]
+        us["upstream_session"]
+        ut["uart_meshtastic (UART1)"]
+    end
+
+    node["Meshtastic node"]
+    mesh(("LoRa mesh"))
+
+    pa & pb & pn -- "ToRadio (write)" --> gatt
+    gatt -- "want_config / heartbeat<br/>(handled locally)" --> us
+    gatt -- "mesh packet" --> ut
+    ut -- "Stream API 0x94 0xC3" --> node
+    node --> mesh
+
+    node -- "FromRadio" --> ut
+    ut --> rt
+    rt -- "FETCHING: cache the burst" --> cc
+    cc -. "replay (serve-on-read)" .-> gatt
+    rt -- "LIVE: broadcast / DST_ID targeted" --> gatt
+    gatt -- "FROMRADIO read + FROMNUM notify" --> pa & pb & pn
+
+    classDef store fill:#fde9c8,stroke:#b7791f,color:#3b2f00;
+    class cc store;
+```
+
+**Two delivery modes in LIVE** (`router.c`):
+- **Broadcast** — standard Meshtastic portnums → all connections (stock app works).
+- **Targeted** — `portnum == PROXY_PORTNUM (256)` → parse the proxy header, deliver to
+  the connection whose registered `proxy_id` matches `DST_ID`; broadcast fallback if
+  unregistered (no silent drop).
+
+---
+
+## 3. State machines
+
+### 3a. Upstream session (one, global) — `upstream_session.c`
+
+```mermaid
+stateDiagram-v2
+    [*] --> BOOT
+    BOOT --> FETCHING: upstream_session_start()<br/>(send own want_config)
+    FETCHING --> FETCHING: config/meta variant<br/>→ cache_add_frame()
+    FETCHING --> CACHE_READY: config_complete_id == our nonce<br/>→ cache_mark_ready()
+    CACHE_READY --> LIVE: serve PENDING phones
+    LIVE --> LIVE: normal routing<br/>(broadcast / targeted)
+    note right of FETCHING
+      packet variants are NOT cached —
+      live mesh traffic is broadcast immediately
+    end note
+```
+
+### 3b. Per-phone (one per BLE connection) — `ble_gatt.c`
+
+```mermaid
+stateDiagram-v2
+    [*] --> CONNECTED: on_connected (alloc slot)
+    CONNECTED --> AWAIT_WANT_CONFIG: subscribe FROMNUM
+    AWAIT_WANT_CONFIG --> REPLAYING: want_config & cache ready
+    AWAIT_WANT_CONFIG --> PENDING: want_config & cache NOT ready
+    PENDING --> REPLAYING: cache becomes ready<br/>(serve callback)
+    REPLAYING --> ACTIVE: cursor drained +<br/>synthesized config_complete_id
+    ACTIVE --> REPLAYING: another want_config<br/>(e.g. 69421 after 69420)
+    ACTIVE --> [*]: on_disconnected (free slot)
+```
+
+The phone may run **two `want_config` rounds** with special nonces — `69420`
+(ONLY_CONFIG) then `69421` (ONLY_NODES) — each re-arming `REPLAYING` with a
+nonce-specific cache segment.
+
+### 3c. System lifecycle — transient vs steady state
+
+The whole system goes through a **transient** phase (boot configuration + connection
+setup) before settling into a **steady** phase where text messaging flows naturally.
+§3a/§3b are the precise per-machine views; this is the system-level overview.
+
+- **TRANSIENT** = the proxy fetches the node's config once (`ProxyBoot`), then each phone
+  connects and runs its `want_config` handshake (`CONFIG_ROUND` 69420 → `NODEDB_ROUND`
+  69421). These are state-changing, one-time-per-(boot / connection) flows.
+- **STEADY** = `OPERATIONAL`: no state changes — the self-loops are the recurring,
+  event-driven message flows (UART RX callbacks delivering text/telemetry → routed BLE
+  notifications; phone writes → UART → mesh; liveness). This is the "stationary" regime.
+
+```mermaid
+stateDiagram-v2
+    [*] --> TRANSIENT
+
+    state TRANSIENT {
+        [*] --> ProxyBoot
+        ProxyBoot: Proxy boot — BOOT → FETCHING → CACHE_READY → LIVE (fetch node config, once)
+        ProxyBoot --> PhoneOnboard: cache ready
+        state PhoneOnboard {
+            [*] --> CONNECTED
+            CONNECTED --> CONFIG_ROUND: subscribe FROMNUM + want_config(69420)
+            CONFIG_ROUND --> NODEDB_ROUND: config_complete(69420) + want_config(69421)
+            NODEDB_ROUND --> [*]: config_complete(69421) → phone ACTIVE
+        }
+    }
+
+    TRANSIENT --> STEADY: cache LIVE and phone ACTIVE
+
+    state STEADY {
+        [*] --> OPERATIONAL
+        OPERATIONAL --> OPERATIONAL: phone ToRadio text → UART → mesh
+        OPERATIONAL --> OPERATIONAL: node FromRadio (text / telemetry / ACK) → router → BLE notify
+        OPERATIONAL --> OPERATIONAL: phone heartbeat → synth queueStatus
+        OPERATIONAL --> OPERATIONAL: ~5 min idle → UART keepalive → node
+    }
+
+    STEADY --> TRANSIENT: phone reconnects / app re-requests want_config
+```
+
+Notes:
+- A phone connecting **before** the cache is ready waits as `PENDING` (§3b) inside the
+  transient phase, then onboards automatically once `ProxyBoot` reaches LIVE.
+- Concurrency: `ProxyBoot` is global (one), `PhoneOnboard` is per-connection (up to 6);
+  they overlap in time. The diagram shows the happy-path ordering — a real phone simply
+  can't finish onboarding until the cache exists.
+- Leaving STEADY → TRANSIENT is per-phone and local: one phone re-running `want_config`
+  (or reconnecting) re-enters its onboarding without disturbing the others or the node.
+
+---
+
+## 4. `want_config` handshake + boot fetch (sequence)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant N as Meshtastic node
+    participant U as uart_meshtastic
+    participant US as upstream_session
+    participant CC as config_cache
+    participant BG as ble_gatt
+    participant P as Phone
+
+    Note over US,N: BOOT — proxy fetches once
+    US->>N: ToRadio{want_config_id = R} (random, ≠0/1)
+    N-->>U: FromRadio burst (my_info, node_info, config, …)
+    U->>US: on_fromradio (per frame)
+    US->>CC: cache_add_frame(...)  [FETCHING]
+    N-->>U: FromRadio{config_complete_id = R}
+    US->>CC: cache_mark_ready()  → LIVE
+
+    Note over P,BG: Phone connects (after CACHE_READY)
+    P->>BG: subscribe FROMNUM
+    P->>BG: ToRadio{want_config_id = 69420}
+    BG->>BG: arm replay (cursor=0, encode cc with 69420)
+    BG-->>P: FROMNUM notify (kick)
+    loop drain until empty
+        P->>BG: read FROMRADIO
+        BG->>CC: cache_frame_in_segment(idx, 69420)?
+        BG-->>P: next cached frame (skips other-node node_info)
+    end
+    BG-->>P: synthesized FromRadio{config_complete_id = 69420} → ACTIVE
+
+    P->>BG: ToRadio{want_config_id = 69421}  (ONLY_NODES)
+    BG-->>P: node_info frames + config_complete_id=69421
+
+    Note over P,N: Steady state (LIVE)
+    P->>BG: ToRadio{heartbeat}
+    BG-->>P: synthesized queueStatus (liveness)
+    P->>BG: ToRadio{mesh packet}
+    BG->>U: forward → node → mesh
+```
+
+`config_complete_id` is **never cached** — it is the terminator; the replay synthesizes
+a fresh one carrying each phone's own nonce.
+
+### 4b. FROMRADIO read → per-connection drain
+
+How a phone's ATT reads resolve to its own queue. The `conn` is provided by the BLE
+stack (it knows which link the read arrived on); `find_slot(conn)` maps it to that
+phone's `proxy_conn` by **pointer identity** — `bt_conn_ref()` is just refcounting, it
+assigns no id.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Phone (central)
+    participant S as Zephyr BLE stack
+    participant FR as fromradio_read()
+    participant PC as proxy_conn (conns[i])
+
+    Note over S,PC: on connect: on_connected(conn) → alloc_slot → bt_conn_ref(conn),<br/>store pointer in a free conns[] slot (= this phone's state)
+    loop drain until a 0-length read
+        P->>S: ATT Read Request (FROMRADIO handle)
+        S->>FR: fromradio_read(conn, …)  [conn = this link]
+        FR->>FR: find_slot(conn) → pc  (conns[i].conn == conn)
+        alt REPLAYING
+            FR->>PC: next in-segment cache frame / synthesized config_complete
+        else ACTIVE
+            FR->>PC: dequeue queue[head] (head++, count--)
+        end
+        FR-->>S: bytes, or 0 when drained
+        S-->>P: ATT Read Response
+    end
+```
+
+Different phones hold different `conn` pointers → different `pc` → **independent queues
+drained in parallel**. That pointer-keyed mapping is the whole basis of the multiplexing.
+
+---
+
+## 5. Threading model
+
+Two execution contexts; `config_cache` is published across them by a Zephyr `atomic_t`
+release/acquire barrier (`cache_mark_ready` / `cache_is_ready`), so no mutex is needed
+for the read-only cache. The per-connection FROMRADIO queue is guarded by a per-`conn`
+`k_mutex`.
+
+```mermaid
+flowchart TB
+    subgraph SWQ["System work queue (single thread)"]
+        rxw["rx_work: UART RX → frame assembly"]
+        onfr["on_fromradio_uart → proto_decode → router_dispatch"]
+        txw["tx_work: drain TX queue → uart_tx"]
+        kaw["keepalive_work (k_work_delayable, ~5 min)"]
+        rxw --> onfr
+    end
+
+    subgraph BTRX["Bluetooth RX thread"]
+        tw["toradio_write → on_toradio_ble<br/>(want_config / heartbeat / packet)"]
+        fr["fromradio_read (serve-on-read replay / queue)"]
+        ccc["CCC + connected/disconnected"]
+    end
+
+    cache[("config_cache<br/>read-only after ready")]
+    onfr -- writes (FETCHING) --> cache
+    fr -- reads (replay) --> cache
+    onfr -. "atomic publish" .-> fr
+
+    tw -- "mesh packet" --> txw
+    kaw -- "ToRadio.heartbeat" --> txw
+
+    classDef store fill:#fde9c8,stroke:#b7791f,color:#3b2f00;
+    class cache store;
+```
+
+**Invariant:** all cache **writes** happen on the system work queue during `FETCHING`;
+**reads** (per-phone replay) happen on the BT RX thread but only after `cache_is_ready()`
+returns true. `k_work_delayable` (not `k_timer`) is used for the keepalive precisely so
+it runs in work-queue context and may touch the UART safely.
+
+---
+
+## 6. Boot sequence (`main.c`)
+
+```mermaid
+flowchart LR
+    a["ble_gatt_init<br/>(register TORADIO cb)"] --> b["bt_enable"]
+    b --> c["ble_gatt_start_advertising"]
+    c --> d["uart_meshtastic_init<br/>(start DMA RX)"]
+    d --> e["upstream_set_serve_cb<br/>(ble_gatt_replay_cached_burst)"]
+    e --> f["upstream_session_start<br/>(send want_config, arm keepalive)"]
+    f --> g["main loop: k_sleep"]
+```
+
+Order matters: GATT is registered before `bt_enable`; the serve callback is registered
+before `upstream_session_start` so a PENDING phone can be served the moment the cache is
+ready.
+
+---
+
+## 7. Module reference
+
+| File | Responsibility | Context |
+|---|---|---|
+| `main.c` | Boot order; `on_toradio_ble` (local handling of want_config/heartbeat, forward packets, reschedule keepalive); `on_fromradio_uart` | BT RX + work queue |
+| `ble_gatt.c/.h` | GATT service (FROMNUM/FROMRADIO/TORADIO/LOGRADIO/NODE_REG), per-phone state, serve-on-read replay, synthesized queueStatus | BT RX |
+| `uart_meshtastic.c/.h` | UART1 async/DMA, Stream API framing (`0x94 0xC3 len_hi len_lo`), RX state machine, TX queue | work queue |
+| `proto_handler.c/.h` | nanopb decode (FromRadio/ToRadio) + encoders (config_complete / heartbeat / queueStatus) | both (stack-local encode) |
+| `proxy_protocol.c/.h` | Custom proxy header parse/build (VERSION/SRC/DST/content), `PROXY_PORTNUM 256` | pure |
+| `router.c/.h` | FromRadio dispatch: FETCHING→cache, LIVE→broadcast / DST_ID targeted; keepalive queueStatus swallow | work queue |
+| `config_cache.c/.h` | Packed contiguous arena + index of the boot burst; per-nonce segmentation; atomic ready barrier; queueStatus lookup | written on WQ, read on BT RX |
+| `upstream_session.c/.h` | Boot `want_config`, BOOT→FETCHING→CACHE_READY→LIVE, Phase 0 instrumentation, UART keepalive | work queue |
+
+## 8. Key invariants (audit checklist)
+
+- **Serve-on-read replay** — one cached frame per FROMRADIO read; never pre-enqueue the
+  burst (would overflow the 8-deep per-conn queue).
+- **`cache_mark_ready()` is a release barrier** — readers seeing `cache_is_ready()` see
+  the fully-written arena.
+- **Burst order preserved**; `config_complete_id` synthesized per phone, never cached.
+- **want_config / heartbeat never reach UART**; only mesh packets do.
+- **Keepalive** fires only after ~5 min of no real ToRadio (rescheduled on each real TX),
+  nonce ≠ 1; its queueStatus reply is swallowed in `router`.
+- **No silent drops** — overflow / unregistered DST_ID fall back to broadcast and log.
+
+> Companion: firmware design rationale in the studio's `ADR-001`. Phone-app integration
+> (broadcast vs router, NODE_REG, portnum-256 framing) in `client-integration.md`.
