@@ -87,11 +87,13 @@ they shim the few Zephyr/nanopb headers they need):
 
 - **Stock Meshtastic app:** works as-is via **broadcast** — every phone behaves like a
   client of the same node (shared `nodenum`, shared config).
-- **Per-phone addressing (router):** a custom/modified app must (1) write its 16-byte
-  `proxy_id` to the **NODE_REG** characteristic on connect, (2) frame messages with the
-  proxy header inside a `portnum 256` MeshPacket, (3) parse inbound `portnum 256`, and
-  (4) maintain a `proxy_id → nodenum` directory. Unregistered `DST_ID`s fall back to
+- **Per-phone addressing (router):** a custom/modified app registers its `proxy_id`
+  (NODE_REG), frames messages with the proxy header inside a `portnum 256` MeshPacket,
+  and maintains a `proxy_id → nodenum` directory. Unregistered `DST_ID`s fall back to
   broadcast.
+
+**→ Full integration guide for app teams: [`docs/CLIENT-INTEGRATION.md`](docs/CLIENT-INTEGRATION.md)**
+(GATT UUIDs, connection lifecycle, wire format, the four app changes, gotchas).
 
 ## Status
 
