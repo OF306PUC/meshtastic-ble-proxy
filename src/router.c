@@ -40,7 +40,7 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
                      const struct fromradio_info *info)
 {
     /* ----------------------------------------------------------------
-     * Upstream config-fetch window (ADR-001): while the proxy is consuming its
+     * Upstream config-fetch window: while the proxy is consuming its
      * own boot config burst, config/meta variants are CONSUMED into the cache
      * (not broadcast). upstream_on_fromradio returns true when it took the frame.
      * Packet variants are NOT consumed (returns false) → fall through so live
@@ -56,7 +56,7 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
     /* ----------------------------------------------------------------
      * Tier 1: non-packet FromRadio variant → broadcast unconditionally,
      * EXCEPT the queueStatus the node sends in reply to our own upstream
-     * keepalive heartbeat (Task D) — that reply is for the proxy, not the
+     * keepalive heartbeat - that reply is for the proxy, not the
      * phones, so swallow it instead of broadcasting noise.
      * ---------------------------------------------------------------- */
     if (info->which_variant != meshtastic_FromRadio_packet_tag) {

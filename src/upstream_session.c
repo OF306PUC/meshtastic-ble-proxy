@@ -323,7 +323,7 @@ void upstream_session_start(void)
     LOG_INF("upstream start: want_config nonce=%u sent (%u B), FETCHING",
             (unsigned)s_nonce, (unsigned)stream.bytes_written);
 
-    /* Arm the UART keepalive (Task D). It fires after UPSTREAM_KEEPALIVE_MS of
+    /* Arm the UART keepalive. It fires after UPSTREAM_KEEPALIVE_MS of
      * silence; every real ToRadio TX pushes it out via
      * upstream_keepalive_reschedule(). */
     k_work_init_delayable(&s_keepalive_work, keepalive_work_handler);

@@ -465,7 +465,7 @@ int ble_gatt_enqueue_fromradio(struct bt_conn *conn, const uint8_t *data, uint16
     uint32_t fromnum_val = pc->fromnum;
     k_mutex_unlock(&pc->lock);
 
-    /* Notify the phone. Zephyr checks CCC internally and drops if not subscribed. */
+    /* Notify the routed contact (phone). Zephyr checks CCC internally and drops if not subscribed. */
     int err = bt_gatt_notify(conn, &meshtastic_svc.attrs[FROMNUM_ATTR_IDX],
                              &fromnum_val, sizeof(fromnum_val));
     if (err) {
