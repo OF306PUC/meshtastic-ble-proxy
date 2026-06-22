@@ -1,7 +1,7 @@
 /*
  * upstream_session.c — the proxy's single config session with the node.
  *
- * State machine (ADR-001):
+ * State machine:
  *
  *   BOOT ──start()──▶ FETCHING ──(config_complete_id == our nonce)──▶
  *                                  CACHE_READY ─(serve pending)─▶ LIVE
@@ -16,7 +16,7 @@
  *   LIVE:
  *     - everything                    → NOT consumed (false): normal routing.
  *
- * Phase 0 instrumentation (MANDATORY hard gate, ADR-001):
+ * Phase 0 instrumentation:
  *   per-variant byte/frame counters are accumulated during FETCHING and dumped
  *   at cache_mark_ready() time, so CONFIG_CACHE_ARENA_BYTES can be sized from
  *   the real node. See log_phase0_breakdown().
@@ -69,8 +69,7 @@ static uint8_t         s_pending_count;
 static void (*s_serve_cb)(struct bt_conn *conn, uint32_t nonce);
 
 /* -------------------------------------------------------------------------
- * Task D — upstream UART keepalive (k_work_delayable, NOT k_timer: a k_timer
- * callback runs in ISR context and may not touch UART/BLE/mutex; a delayable
+ * upstream UART keepalive (k_work_delayable, a delayable
  * work item runs on the system work queue, the same context as everything else
  * here). Period < the node's 15-min serial timeout. Rescheduled on every real
  * ToRadio TX, so it only fires after a stretch of true silence.
@@ -246,7 +245,7 @@ static bool decode_config_complete_nonce(const uint8_t *payload, uint16_t len,
 }
 
 /* -------------------------------------------------------------------------
- * Task D — keepalive work handler. Sends one ToRadio{heartbeat} to refresh the
+ * keepalive work handler. Sends one ToRadio{heartbeat} to refresh the
  * node's serial-activity timer, then re-arms itself. nonce never 0/1.
  * ------------------------------------------------------------------------- */
 static void keepalive_work_handler(struct k_work *work)
@@ -358,8 +357,8 @@ bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
     /* The closing config_complete_id — finish the burst ONLY if it carries
      * OUR nonce. fromradio_info does not expose config_complete_id, so we
      * decode the nonce here with a minimal local nanopb pass (no change to
-     * proto_handler). The proxy is the node's sole want_config client
-     * (ADR-001 §Context), but we still match strictly so a stray/duplicated
+     * proto_handler). The proxy is the node's sole want_config client, 
+     * but we still match strictly so a stray/duplicated
      * config_complete_id can never prematurely close the burst. */
     if (info->which_variant == meshtastic_FromRadio_config_complete_id_tag) {
         uint32_t got_nonce = 0;
@@ -446,7 +445,7 @@ void upstream_on_pending_phone(struct bt_conn *conn)
 }
 
 /* -------------------------------------------------------------------------
- * Task D — keepalive public hooks.
+ * keepalive public hooks.
  * ------------------------------------------------------------------------- */
 void upstream_keepalive_reschedule(void)
 {

@@ -35,7 +35,7 @@ static void on_fromradio_uart(const uint8_t *payload, uint16_t len)
 
 /*
  * Called when a phone writes a ToRadio protobuf to the GATT TORADIO
- * characteristic (ADR-001 per-phone config-session virtualization).
+ * characteristic (per-phone config-session virtualization).
  *
  * The proxy is NO LONGER a blind passthrough:
  *   - want_config_id : served LOCALLY from the cache (replay or PENDING).
@@ -126,7 +126,7 @@ int main(void)
     /* 4. Init UART driver — starts DMA reception immediately.
      *    The Meshtastic node begins sending FromRadio frames once it receives
      *    the proxy's own want_config_id ToRadio (sent by upstream_session_start
-     *    below), not a phone's — phones are served from the cache (ADR-001). */
+     *    below), not a phone's — phones are served from the cache. */
     err = uart_meshtastic_init(on_fromradio_uart);
     if (err) {
         LOG_ERR("uart_meshtastic_init: %d", err);

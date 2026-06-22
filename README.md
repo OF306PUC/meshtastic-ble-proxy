@@ -38,10 +38,7 @@ expected at **`./proto/meshtastic/`**. They are **not** included in this repo �
 them first:
 
 ```sh
-# Option A — symlink a local Meshtastic protobufs checkout:
-ln -s /path/to/meshtastic/protobufs proto
-
-# Option B — git submodule:
+# git submodule:
 git submodule add https://github.com/meshtastic/protobufs proto
 ```
 

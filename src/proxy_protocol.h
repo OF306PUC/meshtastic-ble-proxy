@@ -52,8 +52,8 @@ typedef struct {
 
 /* Parsed proxy header. content points into the original buffer. */
 struct proxy_header {
-    proxy_id_t     src;
-    proxy_id_t     dst;
+    proxy_id_t     src;          /*(sender) message source*/
+    proxy_id_t     dst;          /*(receiver) message destination*/
     const uint8_t *content;      /* pointer into original payload buffer */
     uint16_t       content_len;
 };

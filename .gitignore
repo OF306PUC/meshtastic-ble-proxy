@@ -5,3 +5,6 @@ build*/
 # symlink or submodule). Ignored so a machine-specific symlink isn't committed.
 # (If you add proto as a git submodule, use `git submodule add --force proto`.)
 /proto
+
+# Local session continuity (migrated from studio repo) — never commit to public history
+/.session/

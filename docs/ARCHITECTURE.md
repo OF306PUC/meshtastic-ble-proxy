@@ -206,28 +206,35 @@ sequenceDiagram
     participant BG as ble_gatt
     participant P as Phone
 
-    Note over US,N: BOOT — proxy fetches once
-    US->>N: ToRadio{want_config_id = R} (random, ≠0/1)
+    Note over US,N: BOOT — proxy fetches ONCE with its own random nonce R
+    US->>N: ToRadio{want_config_id = R} (R = random, ≠ 0/1)
     N-->>U: FromRadio burst (my_info, node_info, config, …)
     U->>US: on_fromradio (per frame)
     US->>CC: cache_add_frame(...)  [FETCHING]
     N-->>U: FromRadio{config_complete_id = R}
     US->>CC: cache_mark_ready()  → LIVE
+    Note over CC: R-terminator is cached but NEVER replayed<br/>(would leak the boot nonce to phones)
 
-    Note over P,BG: Phone connects (after CACHE_READY)
+    Note over P,BG: Phone connects (after CACHE_READY) — sends ITS OWN nonce P
     P->>BG: subscribe FROMNUM
-    P->>BG: ToRadio{want_config_id = 69420}
-    BG->>BG: arm replay (cursor=0, encode cc with 69420)
+    P->>BG: ToRadio{want_config_id = P}
+
+    Note over BG,CC: P's VALUE selects the replay segment
+    alt P == 69420 (ONLY_CONFIG) or P == 69421 (ONLY_NODES)
+        Note over BG,CC: replay a SUBSET (config+own node_info / node_info-only)
+    else any other P  (typical — full config request)
+        Note over BG,CC: replay the FULL burst
+    end
+
+    BG->>BG: arm replay (cursor=0), encode fresh cc-frame carrying P
     BG-->>P: FROMNUM notify (kick)
     loop drain until empty
         P->>BG: read FROMRADIO
-        BG->>CC: cache_frame_in_segment(idx, 69420)?
-        BG-->>P: next cached frame (skips other-node node_info)
+        BG->>CC: cache_frame_in_segment(idx, P)?
+        BG-->>P: next in-segment cached frame
     end
-    BG-->>P: synthesized FromRadio{config_complete_id = 69420} → ACTIVE
-
-    P->>BG: ToRadio{want_config_id = 69421}  (ONLY_NODES)
-    BG-->>P: node_info frames + config_complete_id=69421
+    BG-->>P: synthesized FromRadio{config_complete_id = P}
+    Note over P: echoed P matches the nonce the phone sent →<br/>want_config COMPLETES → ACTIVE.<br/>(wrong/absent echo ⇒ phone never completes → timeout + retry)
 
     Note over P,N: Steady state (LIVE)
     P->>BG: ToRadio{heartbeat}
@@ -236,8 +243,17 @@ sequenceDiagram
     BG->>U: forward → node → mesh
 ```
 
+**Nonce roles (the key idea):**
+- **R** — the proxy's own boot nonce. Used *once*, proxy→node, to build the shared cache. Never seen by a phone.
+- **P** — each phone's own nonce. Never reaches the node. It has exactly two jobs: (1) its **value** selects the replay segment — `69420`/`69421` request a subset, *any other value* gets the full burst; (2) it is **echoed back** verbatim in the synthesized `config_complete_id` so the phone recognizes the burst as the answer to *its* request and completes its `want_config` state machine.
+
 `config_complete_id` is **never cached** — it is the terminator; the replay synthesizes
-a fresh one carrying each phone's own nonce.
+a fresh one carrying each phone's own nonce `P`.
+
+> The real Meshtastic Android client typically runs **two** rounds — `want_config(69420)`
+> then `want_config(69421)` — to fetch config and the node DB separately (see §3b/§3c).
+> Both are just specific values of `P`; a client issuing a single arbitrary nonce would
+> instead receive the full burst in one round.
 
 ### 4b. FROMRADIO read → per-connection drain
 

@@ -8,8 +8,7 @@
  * Routing information extracted from a decoded FromRadio message.
  *
  * payload_bytes / payload_len are valid only when:
- *   which_variant == meshtastic_FromRadio_packet_tag  AND
- *   is_decoded    == true
+ *   which_variant==meshtastic_FromRadio_packet_tag AND is_decoded==true
  *
  * payload_bytes points into proto_handler's internal static buffer.
  * It remains valid until the next call to proto_decode_fromradio().

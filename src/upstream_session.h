@@ -14,7 +14,6 @@
  * UART, consumes the ordered FromRadio burst into config_cache, and on the
  * matching config_complete_id marks the cache ready and goes LIVE. Phones that
  * connect before the cache is ready are queued PENDING and served once ready.
- * See ADR-001 (State machines, Module plan, Phase 0).
  *
  * Threading: all entry points run on the single Zephyr system work queue (the
  * UART RX callback path and the BLE callback path are both work-queue context).
@@ -51,7 +50,7 @@ enum upstream_state upstream_get_state(void);
  * Register the per-phone replay callback (dependency inversion).
  *
  * upstream_session must serve PENDING phones once the cache is ready, but it has
- * NO dependency on ble_gatt (ADR-001 — no layering inversion). main wires
+ * NO dependency on ble_gatt. main wires
  * ble_gatt_replay_cached_burst here at boot; serve_one_pending() invokes it.
  *
  * @param cb  called as cb(conn, nonce). upstream passes nonce = 0, meaning
@@ -85,7 +84,7 @@ bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
 void upstream_on_pending_phone(struct bt_conn *conn);
 
 /*
- * Task D — upstream UART keepalive.
+ * upstream UART keepalive.
  *
  * Push the keepalive timer out by the full interval. Called by main on every
  * real ToRadio packet forwarded to the node, so the keepalive heartbeat only
@@ -95,7 +94,7 @@ void upstream_on_pending_phone(struct bt_conn *conn);
 void upstream_keepalive_reschedule(void);
 
 /*
- * Task D — keepalive queueStatus swallow.
+ * keepalive queueStatus swallow.
  *
  * The node replies to our keepalive heartbeat with a queueStatus FromRadio.
  * That reply is for the proxy, not the phones, so router calls this when it

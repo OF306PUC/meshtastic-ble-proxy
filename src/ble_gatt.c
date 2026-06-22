@@ -84,7 +84,7 @@ struct proxy_conn {
     proxy_id_t       proxy_id;       /* Phone identifier registered via NODE_REG    */
     uint32_t         fromnum;        /* Monotonically incrementing packet counter   */
 
-    /* Per-phone config-session state (ADR-001) */
+    /* Per-phone config-session state */
     enum phone_state state;          /* CONNECTED → … → ACTIVE                       */
     uint32_t         nonce;          /* This phone's want_config nonce               */
     uint16_t         replay_cursor;  /* Next cache frame index to replay             */
@@ -528,7 +528,7 @@ void ble_gatt_replay_cached_burst(struct bt_conn *conn, uint32_t nonce)
     }
 
     /*
-     * Two entry paths share this function (ADR-001):
+     * Two entry paths share this function:
      *   - cache already ready: on_toradio_ble calls with the phone's live nonce.
      *   - PENDING served later: upstream's serve callback fires here; the phone's
      *     nonce was stored by ble_gatt_park_pending() (upstream tracks only conn,
@@ -540,7 +540,7 @@ void ble_gatt_replay_cached_burst(struct bt_conn *conn, uint32_t nonce)
     nonce = pc->nonce;
 
     /*
-     * ADR-001 serve-on-read replay. We do NOT pre-enqueue the burst: a real
+     * We do NOT pre-enqueue the burst: a real
      * want_config burst is dozens of frames and would overflow the 8-deep
      * per-conn queue (frames 9+ would be dropped mid-handshake). Instead we
      * pre-encode the trailing config_complete_id once, arm a cursor, and let

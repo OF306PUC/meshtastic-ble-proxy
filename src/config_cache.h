@@ -7,7 +7,7 @@
 /*
  * config_cache — boot-populated, read-only-after-ready store of the node's
  * config burst (the ordered FromRadio frames the node emits in response to a
- * want_config). See ADR-001 (Module plan, RAM budget, Phase 0).
+ * want_config).
  *
  * The arena is a single packed contiguous byte buffer: frames are stored
  * back-to-back with NO per-frame padding (the per-frame 512 B cap is a
@@ -27,7 +27,7 @@
  * There are NO mutexes in this module. All writes (cache_begin / cache_add_frame
  * / cache_mark_ready) run on the single Zephyr system work queue (the UART RX
  * callback path), so writers never race each other. Readers (per-phone replay
- * in ble_gatt, Task C) also run on the system work queue today — but
+ * in ble_gatt) also run on the system work queue today — but
  * cache_mark_ready() still publishes via a Zephyr atomic_t store, and
  * cache_is_ready() reads it via an atomic load. Those atomics carry the
  * acquire/release barrier that guarantees: any reader that observes
@@ -37,10 +37,10 @@
  * thread) without adding a mutex.
  */
 
-/* Default arena size — 16 KB. ADR-001 RAM budget sizes this from the real
+/* Default arena size — 4 KB. RAM budget sizes this from the real
  * node's Phase 0 boot measurement; upstream_session logs the observed total.
- * Update this define (and ADR-001) once Phase 0 has been measured. */
-#define CONFIG_CACHE_ARENA_BYTES 4096  /* 16 KB default; update after Phase 0 measurement */
+ * Update this define once Phase 0 has been measured. */
+#define CONFIG_CACHE_ARENA_BYTES 4096  /* 4 KB default; update after Phase 0 measurement */
 
 /* Max number of frames the index can hold. node_info dominates the count
  * (one frame per mesh node). */

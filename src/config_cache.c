@@ -65,7 +65,7 @@ void cache_begin(void)
 
 int cache_add_frame(const uint8_t *raw, uint16_t len, int variant)
 {
-    /* Overflow policy (ADR-001): never silently cap. Reject the frame and
+    /* Overflow policy: never silently cap. Reject the frame and
      * LOG_WRN with exact byte counts; the fixed part + first K node_info that
      * already fit remain valid, the rest repopulate via live broadcast. */
     if (s_count >= CONFIG_CACHE_MAX_FRAMES) {

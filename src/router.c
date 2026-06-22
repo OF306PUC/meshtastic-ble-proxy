@@ -15,7 +15,7 @@
  *     registered proxy_id matches DST_ID in the header.
  *     Fallback to broadcast if:
  *       - Payload too short to contain a valid header
- *       - No connection has registered the target DST_ID yet
+ *       - No connection has registered the target DST_ID yet (TODO: no broadcast)
  *
  *   portnum != PROXY_PORTNUM (standard Meshtastic traffic):
  *     Broadcast to all connections.

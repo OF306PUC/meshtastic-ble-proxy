@@ -17,7 +17,7 @@
 #define FROMRADIO_MAX_PKT_SIZE  512
 
 /*
- * Per-phone config-session state (ADR-001, per-phone state machine).
+ * Per-phone config-session state.
  *
  *   CONNECTED          → just connected (CCCD not yet subscribed)
  *   AWAIT_WANT_CONFIG  → subscribed, waiting for the phone's want_config
@@ -91,7 +91,7 @@ int ble_gatt_register_proxy_id(struct bt_conn *conn, const proxy_id_t *id);
 /*
  * Replay the boot-populated config cache to a single phone, then close the
  * burst with a synthesized FromRadio{config_complete_id = nonce} carrying THAT
- * phone's nonce (ADR-001 per-phone replay).
+ * phone's nonce (per-phone replay).
  *
  * Frames are read straight from the shared config_cache arena via a cursor and
  * enqueued one by one — the whole burst is never copied into the per-conn queue
