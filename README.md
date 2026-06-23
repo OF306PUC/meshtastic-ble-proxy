@@ -56,17 +56,6 @@ west flash
 Set the BLE device name in `prj.conf` before flashing — it must match
 `^.*_([0-9a-fA-F]{4})$` (a 4-hex suffix), e.g. `Meshtastic_CA1E`.
 
-## Host unit tests (no hardware)
-
-`tests/` holds host-side gcc tests (each file's top comment has its exact compile line;
-they shim the few Zephyr/nanopb headers they need):
-
-- `proto_handler_test.c` — `ToRadio` decode + `config_complete`/`heartbeat`/`queueStatus`
-  encoders (round-trip).
-- `config_cache_test.c` — arena packing, overflow-without-corruption, atomic ready barrier.
-- `config_cache_segment_test.c` — `want_config` special-nonce segmentation (data-driven
-  against real captured bursts).
-
 ## Source layout (`src/`)
 
 | File | Responsibility |
