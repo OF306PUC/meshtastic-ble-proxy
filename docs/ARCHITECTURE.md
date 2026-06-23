@@ -103,6 +103,112 @@ flowchart LR
   the connection whose registered `proxy_id` matches `DST_ID`; broadcast fallback if
   unregistered (no silent drop).
 
+### 2a. Router dispatch decision tree (`router.c`)
+
+Every `FromRadio` frame arriving from the node runs this cascade (early-return order).
+Exactly **one** branch unicasts to a single phone; every other branch either broadcasts
+or is absorbed locally. Two invariants hold throughout: **never silently drop** (every
+uncertain case falls back to broadcast) and **stay transparent to the stock app**
+(standard portnums always broadcast).
+
+```mermaid
+flowchart TD
+    A["FromRadio frame from UART<br/>proto_decode_fromradio"] --> B{decode ok?}
+    B -- no --> Zr["broadcast raw"]
+    B -- yes --> C{upstream FETCHING<br/>&amp; frame consumed?}
+    C -- "yes: config/meta" --> CA["cache_add_frame<br/>(consumed, not sent)"]
+    C -- "no / packet variant" --> D{packet variant?}
+
+    D -- "no: config/meta" --> E{keepalive<br/>queueStatus?}
+    E -- yes --> EA["swallow<br/>(proxy-only reply)"]
+    E -- no --> Zc["broadcast (all phones)"]
+
+    D -- yes --> F{decoded / plaintext?}
+    F -- "no: encrypted" --> Ze["broadcast<br/>(can't inspect)"]
+    F -- yes --> G{"portnum == 256<br/>(PROXY_PORTNUM)?"}
+
+    G -- no --> Zs["broadcast<br/>(standard traffic)"]
+    G -- yes --> H{header valid<br/>&amp; DST_ID registered?}
+    H -- yes --> I["UNICAST to that phone<br/>ble_gatt_enqueue_fromradio"]
+    H -- no --> Zf["broadcast fallback<br/>(no silent drop)"]
+
+    classDef cast fill:#cfe8ff,stroke:#2b6cb0,color:#14213d;
+    classDef absorb fill:#fde9c8,stroke:#b7791f,color:#3b2f00;
+    class I cast;
+    class CA,EA absorb;
+```
+
+> **TODO (`router.c:18`)** — the unknown-`DST_ID` branch currently broadcasts; the team is
+> reconsidering this, since a targeted message leaking to all phones contradicts the strict
+> 1:1 model when the recipient hasn't registered yet.
+
+### 2b. What gets forwarded: the `MeshPacket`
+
+The router **never re-encodes**. It decodes a `FromRadio` only to read the few routing
+fields it needs (variant, `is_decoded`, `portnum`, and — for `PROXY_PORTNUM` — the proxy
+header inside the payload), then forwards the **original raw protobuf bytes verbatim** to
+the chosen connection(s). Consequence: the phone receives the **entire** `MeshPacket`, so
+the BLE client still sees all the LoRa radio metrics (`rx_snr`, `rx_rssi`), the mesh
+forwarding state (`hop_limit`, `hop_start`, `relay_node`, `next_hop`), and flags like
+`want_ack` — exactly as a directly-attached Meshtastic client would.
+
+`FromRadio.packet` is a `MeshPacket`; when plaintext, its `decoded` field nests a `Data`
+sub-message (`decoded` and `encrypted` are a `oneof` — exactly one is present):
+
+```
+MeshPacket {
+  # addressing / identity
+  from                 fixed32   # 1  sender node ID
+  to                   fixed32   # 2  destination node ID (0xffffffff = broadcast)
+  channel              uint32    # 3  channel index/hash
+  id                   fixed32   # 6  unique packet ID (ACK / dedup)
+
+  # payload — oneof payload_variant (exactly ONE present)
+  decoded              Data      # 4  plaintext  → see below
+  encrypted            bytes     # 5  ciphertext (mutually exclusive with decoded)
+
+  # LoRa receive metrics (filled by the receiving node)
+  rx_time              uint32    # 7  epoch secs received
+  rx_snr               float     # 8  signal-to-noise ratio
+  rx_rssi              int32     # 12 received signal strength
+
+  # mesh forwarding control
+  hop_limit            uint32    # 9  hops remaining
+  hop_start            uint32    # 15 hops at origin
+  want_ack             bool      # 10 sender wants an ACK
+  priority             Priority  # 11 transmit-queue priority (internal)
+  via_mqtt             bool      # 14 traversed an MQTT gateway
+  next_hop             uint32    # 18 next hop node (low byte)
+  relay_node           uint32    # 19 relaying node (low byte)
+  tx_after             uint32    # 20 delay tx until this time
+
+  # PKI / encryption
+  public_key           bytes     # 16 sender pubkey (PKI)
+  pki_encrypted        bool      # 17 PKI vs channel PSK
+  transport_mechanism  TransportMechanism  # 21 how it arrived (LoRa / MQTT / …)
+  # (field 13 skipped — deprecated `delayed`)
+}
+
+Data {                           # = MeshPacket.decoded
+  portnum              PortNum   # 1  which app owns the payload
+  payload              bytes     # 2  raw application bytes (proxy header lives here for PROXY_PORTNUM)
+  want_response        bool      # 3  request expects a reply
+  dest                 fixed32   # 4  app-level destination
+  source               fixed32   # 5  app-level source
+  request_id           fixed32   # 6  ID this responds to
+  reply_id             fixed32   # 7  for replies / reactions
+  emoji                fixed32   # 8  reaction emoji
+  bitfield             uint32    # 9  optional flags
+}
+```
+
+The router keys its whole decision tree (§2a) off just three of these — `is_decoded`,
+`portnum`, and the proxy header parsed out of `decoded.payload`. Everything else (metrics,
+hops, PKI, priority) rides through untouched. Note the proxy's per-phone `DST_ID` lives
+**inside** `decoded.payload` (the proxy header), *not* in `MeshPacket.to` — `to` is the
+Meshtastic node-level address; `DST_ID` is the proxy address layered on via
+`PROXY_PORTNUM (256)`.
+
 ---
 
 ## 3. State machines
@@ -344,5 +450,5 @@ ready.
   nonce ≠ 1; its queueStatus reply is swallowed in `router`.
 - **No silent drops** — overflow / unregistered DST_ID fall back to broadcast and log.
 
-> Companion: firmware design rationale in the studio's `ADR-001`. Phone-app integration
+> Companion: Phone-app integration
 > (broadcast vs router, NODE_REG, portnum-256 framing) in `client-integration.md`.
