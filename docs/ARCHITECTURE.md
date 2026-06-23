@@ -107,88 +107,57 @@ flowchart LR
 
 ## 3. State machines
 
-### 3a. Upstream session (one, global) — `upstream_session.c`
+### 3a. State machines — upstream session + per-phone connection (unified)
 
-```mermaid
-stateDiagram-v2
-    [*] --> BOOT
-    BOOT --> FETCHING: upstream_session_start()<br/>(send own want_config)
-    FETCHING --> FETCHING: config/meta variant<br/>→ cache_add_frame()
-    FETCHING --> CACHE_READY: config_complete_id == our nonce<br/>→ cache_mark_ready()
-    CACHE_READY --> LIVE: serve PENDING phones
-    LIVE --> LIVE: normal routing<br/>(broadcast / targeted)
-    note right of FETCHING
-      packet variants are NOT cached —
-      live mesh traffic is broadcast immediately
-    end note
-```
+The two state machines that drive onboarding, shown together: the **global upstream
+session** (`upstream_session.c`, one instance — `BOOT → FETCHING → CACHE_READY → LIVE`)
+and the **per-phone connection** machine (`ble_gatt.c`, one per BLE connection, up to 6 —
+`CONNECTED → AWAIT_WANT_CONFIG → {PENDING} → REPLAYING → ACTIVE`).
 
-### 3b. Per-phone (one per BLE connection) — `ble_gatt.c`
+<p align="center">
+  <img src="figs/state-machines.svg" alt="Upstream-session and per-phone connection state machines (unified)" width="65%">
+</p>
 
-```mermaid
-stateDiagram-v2
-    [*] --> CONNECTED: on_connected (alloc slot)
-    CONNECTED --> AWAIT_WANT_CONFIG: subscribe FROMNUM
-    AWAIT_WANT_CONFIG --> REPLAYING: want_config & cache ready
-    AWAIT_WANT_CONFIG --> PENDING: want_config & cache NOT ready
-    PENDING --> REPLAYING: cache becomes ready<br/>(serve callback)
-    REPLAYING --> ACTIVE: cursor drained +<br/>synthesized config_complete_id
-    ACTIVE --> REPLAYING: another want_config<br/>(e.g. 69421 after 69420)
-    ACTIVE --> [*]: on_disconnected (free slot)
-```
+<p align="center"><em>Figure 3a — left: the single upstream session that fetches the node config once into the shared cache. Right: the per-phone machine; a phone that connects before the cache is ready waits in <code>PENDING</code> and is served automatically once the upstream reaches LIVE.</em></p>
 
-The phone may run **two `want_config` rounds** with special nonces — `69420`
-(ONLY_CONFIG) then `69421` (ONLY_NODES) — each re-arming `REPLAYING` with a
-nonce-specific cache segment.
+**Two `want_config` rounds.** The phone may run **two `want_config` rounds** with special
+nonces — `69420` (ONLY_CONFIG) then `69421` (ONLY_NODES) — each re-arming `REPLAYING`
+with a nonce-specific cache segment.
 
-### 3c. System lifecycle — transient vs steady state
+**The `config_complete_id` terminator.** In the Meshtastic protocol,
+`FromRadio{config_complete_id = N}` is the **terminator** of a `want_config` burst. The
+client treats it as "the config download keyed by nonce `N` is now complete." A phone
+that sent `want_config_id = P` is specifically waiting for a `config_complete_id` equal to
+`P` — that is its signal to leave the config-download state and go `ACTIVE`. The proxy
+therefore never replays the cached terminator (it carries the proxy's boot nonce `R`); it
+**synthesizes** a fresh one carrying each phone's own `P` (see §4).
+
+### 3b. System lifecycle — transient vs steady state
 
 The whole system goes through a **transient** phase (boot configuration + connection
 setup) before settling into a **steady** phase where text messaging flows naturally.
-§3a/§3b are the precise per-machine views; this is the system-level overview.
+§3a is the precise per-machine view; this is the system-level overview.
 
-- **TRANSIENT** = the proxy fetches the node's config once (`ProxyBoot`), then each phone
-  connects and runs its `want_config` handshake (`CONFIG_ROUND` 69420 → `NODEDB_ROUND`
-  69421). These are state-changing, one-time-per-(boot / connection) flows.
+- **TRANSIENT** = the proxy fetches the node's config once, then each phone connects and
+  runs its `want_config` handshake (config round `69420` → node-DB round `69421`). These
+  are state-changing, one-time-per-(boot / connection) flows — the detailed mechanics live
+  in the §3a machines.
 - **STEADY** = `OPERATIONAL`: no state changes — the self-loops are the recurring,
   event-driven message flows (UART RX callbacks delivering text/telemetry → routed BLE
   notifications; phone writes → UART → mesh; liveness). This is the "stationary" regime.
 
-```mermaid
-stateDiagram-v2
-    [*] --> TRANSIENT
+<p align="center">
+  <img src="figs/steady-state.svg" alt="Steady-state operational message flows" width="65%">
+</p>
 
-    state TRANSIENT {
-        [*] --> ProxyBoot
-        ProxyBoot: Proxy boot — BOOT → FETCHING → CACHE_READY → LIVE (fetch node config, once)
-        ProxyBoot --> PhoneOnboard: cache ready
-        state PhoneOnboard {
-            [*] --> CONNECTED
-            CONNECTED --> CONFIG_ROUND: subscribe FROMNUM + want_config(69420)
-            CONFIG_ROUND --> NODEDB_ROUND: config_complete(69420) + want_config(69421)
-            NODEDB_ROUND --> [*]: config_complete(69421) → phone ACTIVE
-        }
-    }
-
-    TRANSIENT --> STEADY: cache LIVE and phone ACTIVE
-
-    state STEADY {
-        [*] --> OPERATIONAL
-        OPERATIONAL --> OPERATIONAL: phone ToRadio text → UART → mesh
-        OPERATIONAL --> OPERATIONAL: node FromRadio (text / telemetry / ACK) → router → BLE notify
-        OPERATIONAL --> OPERATIONAL: phone heartbeat → synth queueStatus
-        OPERATIONAL --> OPERATIONAL: ~5 min idle → UART keepalive → node
-    }
-
-    STEADY --> TRANSIENT: phone reconnects / app re-requests want_config
-```
+<p align="center"><em>Figure 3b — the steady (<code>OPERATIONAL</code>) regime: recurring, event-driven flows once the cache is LIVE and the phone is ACTIVE. (TODO: this figure still omits the broadcast path — node FromRadio fanned out to all connected phones.)</em></p>
 
 Notes:
-- A phone connecting **before** the cache is ready waits as `PENDING` (§3b) inside the
-  transient phase, then onboards automatically once `ProxyBoot` reaches LIVE.
-- Concurrency: `ProxyBoot` is global (one), `PhoneOnboard` is per-connection (up to 6);
-  they overlap in time. The diagram shows the happy-path ordering — a real phone simply
-  can't finish onboarding until the cache exists.
+- A phone connecting **before** the cache is ready waits as `PENDING` (§3a) inside the
+  transient phase, then onboards automatically once the upstream reaches LIVE.
+- Concurrency: the upstream session is global (one); the per-phone machine is
+  per-connection (up to 6); they overlap in time. The happy-path ordering holds because a
+  real phone simply can't finish onboarding until the cache exists.
 - Leaving STEADY → TRANSIENT is per-phone and local: one phone re-running `want_config`
   (or reconnecting) re-enters its onboarding without disturbing the others or the node.
 
@@ -251,7 +220,7 @@ sequenceDiagram
 a fresh one carrying each phone's own nonce `P`.
 
 > The real Meshtastic Android client typically runs **two** rounds — `want_config(69420)`
-> then `want_config(69421)` — to fetch config and the node DB separately (see §3b/§3c).
+> then `want_config(69421)` — to fetch config and the node DB separately (see §3a/§3b).
 > Both are just specific values of `P`; a client issuing a single arbitrary nonce would
 > instead receive the full burst in one round.
 
