@@ -64,7 +64,7 @@ void cache_begin(void);
  * Append one raw FromRadio frame (protobuf bytes, no serial header) to the
  * arena, in burst order.
  *
- * Overflow policy (ADR-001 — never a silent cap): if appending this frame
+ * Overflow policy: if appending this frame
  * would exceed CONFIG_CACHE_ARENA_BYTES or CONFIG_CACHE_MAX_FRAMES, the frame
  * is rejected and a LOG_WRN is emitted with exact byte counts. The fixed part
  * of the burst (my_info, deviceuiConfig, metadata, channel, config,
@@ -92,7 +92,7 @@ const struct cache_frame_ref *cache_frame_at(uint16_t idx);
  * The arena is private to config_cache; per-phone replay (ble_gatt) holds only
  * a cache_frame_ref (from cache_frame_at) and resolves it to bytes here, so the
  * replay path reads STRAIGHT FROM THE SHARED ARENA — no per-connection copy of
- * the burst (ADR-001 RAM budget). The pointer is valid for the cache lifetime
+ * the burst. The pointer is valid for the cache lifetime
  * (read-only after cache_mark_ready). Returns NULL if ref is NULL.
  */
 const uint8_t *cache_frame_bytes(const struct cache_frame_ref *ref);
@@ -103,7 +103,7 @@ uint16_t cache_frame_count(void);
 /*
  * Meshtastic special want_config nonces (PhoneAPI). The real phone app fetches
  * the node in TWO rounds with these sentinel nonces (confirmed against a real
- * node, .tmp/burst_*.hex, and NimbleBluetooth.cpp). See ADR-001 and memory
+ * node, .tmp/burst_*.hex, and NimbleBluetooth.cpp). See memory
  * meshtastic-want-config-special-nonces.
  */
 #define MESH_NONCE_ONLY_CONFIG 69420u  /* config + OWN node_info; skip other nodes */

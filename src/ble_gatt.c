@@ -203,7 +203,7 @@ static ssize_t fromradio_read(struct bt_conn *conn, const struct bt_gatt_attr *a
         /* Fresh read: stage the next packet (or mark empty). */
         if (pc->state == PHONE_REPLAYING) {
             /*
-             * ADR-001 serve-on-read replay: hand back ONE cached config frame per
+             * Serve-on-read replay: hand back ONE cached config frame per
              * ATT read, straight from the shared arena, then the synthesized
              * config_complete_id, then go ACTIVE. This keeps RAM at O(1) per conn
              * (no pre-enqueue of a dozens-of-frames burst into the 8-deep queue).
@@ -540,8 +540,8 @@ void ble_gatt_replay_cached_burst(struct bt_conn *conn, uint32_t nonce)
     nonce = pc->nonce;
 
     /*
-     * We do NOT pre-enqueue the burst: a real
-     * want_config burst is dozens of frames and would overflow the 8-deep
+     * We do NOT pre-enqueue the burst: a real want_config burst is 
+     * dozens of frames and would overflow the 8-deep
      * per-conn queue (frames 9+ would be dropped mid-handshake). Instead we
      * pre-encode the trailing config_complete_id once, arm a cursor, and let
      * fromradio_read() serve one cached frame per ATT read straight from the
