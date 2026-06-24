@@ -43,6 +43,7 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/drivers/gpio.h>
 
 LOG_MODULE_REGISTER(ble_gatt, LOG_LEVEL_DBG);
 
@@ -67,6 +68,38 @@ static struct bt_uuid_128 uuid_fromradio      = BT_UUID_INIT_128(BT_UUID_FROMRAD
 static struct bt_uuid_128 uuid_toradio        = BT_UUID_INIT_128(BT_UUID_TORADIO_VAL);
 static struct bt_uuid_128 uuid_logradio       = BT_UUID_INIT_128(BT_UUID_LOGRADIO_VAL);
 static struct bt_uuid_128 uuid_node_reg       = BT_UUID_INIT_128(BT_UUID_NODE_REG_VAL);
+
+/* Blinky LED assignments (BLE events): led0=FromRadio, led1=ToRadio */
+#define LED0_NODE DT_ALIAS(led0) /* FromRadio messages */
+#define LED1_NODE DT_ALIAS(led1) /* To Radio messages */
+
+static const struct gpio_dt_spec led_ble_0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+static const struct gpio_dt_spec led_ble_1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
+
+/* Activity LEDs blink while BLE traffic is flowing */
+#define LED_BLINK_PERIOD K_MSEC(120)
+
+static atomic_t led0_active; /* FromRadio activity (FROMNUM polls) */
+static atomic_t led1_active; /* ToRadio activity (writes) */
+
+static void led_blink_tick(const struct gpio_dt_spec *led, atomic_t *active)
+{
+    if (atomic_set(active, 0) != 0) {
+        (void)gpio_pin_toggle_dt(led); /* traffic since last tick: blink */
+    } else {
+        (void)gpio_pin_set_dt(led, 0); /* idle: hold off */
+    }
+}
+
+static void led_blink_work(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    led_blink_tick(&led_ble_0, &led0_active);
+    led_blink_tick(&led_ble_1, &led1_active);
+    k_work_reschedule(k_work_delayable_from_work(work), LED_BLINK_PERIOD);
+}
+
+static K_WORK_DELAYABLE_DEFINE(led_blink_dwork, led_blink_work);
 
 /* Attribute indices for notify targets (see layout comment at top of file) */
 #define FROMNUM_ATTR_IDX  2
@@ -167,6 +200,10 @@ static ssize_t fromnum_read(struct bt_conn *conn, const struct bt_gatt_attr *att
     if (!pc) {
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
+
+    /* Mark FromRadio activity; the blink worker drives the LED. */
+    atomic_set(&led0_active, 1);
+
     uint32_t val = pc->fromnum;
     return bt_gatt_attr_read(conn, attr, buf, len, offset, &val, sizeof(val));
 }
@@ -286,6 +323,10 @@ static ssize_t toradio_write(struct bt_conn *conn, const struct bt_gatt_attr *at
         return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
     }
     LOG_DBG("TORADIO: %d bytes from conn %p", len, (void *)conn);
+
+    /* Mark ToRadio activity; the blink worker drives the LED. */
+    atomic_set(&led1_active, 1);
+
     if (toradio_handler) {
         toradio_handler(conn, buf, len);
     }
@@ -429,6 +470,21 @@ int ble_gatt_start_advertising(void)
 
 int ble_gatt_init(toradio_cb_t cb)
 {
+    /* Activity LEDs: start off, toggle on BLE read/write events. */
+    if (gpio_is_ready_dt(&led_ble_0) && gpio_is_ready_dt(&led_ble_1)) {
+        int ret = gpio_pin_configure_dt(&led_ble_0, GPIO_OUTPUT_INACTIVE);
+        if (ret < 0) {
+            LOG_ERR("LED0 failed to be configured: %d", ret);
+        }
+
+        ret = gpio_pin_configure_dt(&led_ble_1, GPIO_OUTPUT_INACTIVE);
+        if (ret < 0) {
+            LOG_ERR("LED1 failed to be configured: %d", ret);
+        }
+
+        k_work_schedule(&led_blink_dwork, LED_BLINK_PERIOD);
+    }
+
     toradio_handler = cb;
     for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
         k_mutex_init(&conns[i].lock);

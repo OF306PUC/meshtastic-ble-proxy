@@ -17,6 +17,7 @@
 #include "uart_meshtastic.h"
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -81,6 +82,38 @@ RING_BUF_DECLARE(rx_ring_buf, RING_BUF_SIZE);
 
 static const struct device  *uart_dev;
 static fromradio_uart_cb_t   fromradio_cb;
+
+/* ------------------------------------------------------------- Activity LEDs */
+
+/* Blink while UART traffic is flowing: rx=led2, tx=led3 */
+#define LED_RX_NODE DT_ALIAS(led2) /* UART RX (from Meshtastic) */
+#define LED_TX_NODE DT_ALIAS(led3) /* UART TX (to Meshtastic)   */
+
+#define LED_BLINK_PERIOD K_MSEC(120)
+
+static const struct gpio_dt_spec led_uart_rx = GPIO_DT_SPEC_GET(LED_RX_NODE, gpios);
+static const struct gpio_dt_spec led_uart_tx = GPIO_DT_SPEC_GET(LED_TX_NODE, gpios);
+
+static atomic_t uart_rx_active;
+static atomic_t uart_tx_active;
+
+static void led_blink_tick(const struct gpio_dt_spec *led, atomic_t *active)
+{
+    if (atomic_set(active, 0) != 0) {
+        (void)gpio_pin_toggle_dt(led); /* traffic since last tick: blink */
+    } else {
+        (void)gpio_pin_set_dt(led, 0); /* idle: hold off */
+    }
+}
+
+static void led_blink_work(struct k_work *work)
+{
+    led_blink_tick(&led_uart_rx, &uart_rx_active);
+    led_blink_tick(&led_uart_tx, &uart_tx_active);
+    k_work_reschedule(k_work_delayable_from_work(work), LED_BLINK_PERIOD);
+}
+
+static K_WORK_DELAYABLE_DEFINE(led_blink_dwork, led_blink_work);
 
 /* --------------------------------------------------------- RX state machine */
 
@@ -211,6 +244,7 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
         ring_buf_put(&rx_ring_buf,
                      evt->data.rx.buf + evt->data.rx.offset,
                      evt->data.rx.len);
+        atomic_set(&uart_rx_active, 1);
         k_work_submit(&rx_work);
         break;
 
@@ -224,6 +258,7 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 
     case UART_TX_DONE:
         tx_in_progress = false;
+        atomic_set(&uart_tx_active, 1);
         /* Drain the next queued entry, if any. */
         k_work_submit(&tx_work);
         break;
@@ -246,6 +281,21 @@ int uart_meshtastic_init(fromradio_uart_cb_t cb)
     fromradio_cb   = cb;
     rx_sm.state    = RX_WAIT_MAGIC1;
     tx_in_progress = false;
+
+    /* Activity LEDs: start off, toggle while UART traffic is flowing. */
+    if (gpio_is_ready_dt(&led_uart_rx) && gpio_is_ready_dt(&led_uart_tx)) {
+        int led_err = gpio_pin_configure_dt(&led_uart_rx, GPIO_OUTPUT_INACTIVE);
+        if (led_err < 0) {
+            LOG_ERR("UART RX LED (led2) configure failed: %d", led_err);
+        }
+
+        led_err = gpio_pin_configure_dt(&led_uart_tx, GPIO_OUTPUT_INACTIVE);
+        if (led_err < 0) {
+            LOG_ERR("UART TX LED (led3) configure failed: %d", led_err);
+        }
+
+        k_work_schedule(&led_blink_dwork, LED_BLINK_PERIOD);
+    }
 
     uart_dev = DEVICE_DT_GET(DT_NODELABEL(uart1));
     if (!device_is_ready(uart_dev)) {
