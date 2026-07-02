@@ -32,6 +32,9 @@
  *   [12] NODE_REG characteristic value
  */
 
+#include <stdio.h>
+#include <stdint.h>
+
 #include "ble_gatt.h"
 #include "config_cache.h"
 #include "proto_handler.h"
@@ -73,14 +76,14 @@ static struct bt_uuid_128 uuid_node_reg       = BT_UUID_INIT_128(BT_UUID_NODE_RE
 #define LED0_NODE DT_ALIAS(led0) /* FromRadio messages */
 #define LED1_NODE DT_ALIAS(led1) /* To Radio messages */
 
-static const struct gpio_dt_spec led_ble_0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
-static const struct gpio_dt_spec led_ble_1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
+static const struct gpio_dt_spec led_ble_fromradio = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+static const struct gpio_dt_spec led_ble_toradio   = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
 
 /* Activity LEDs blink while BLE traffic is flowing */
 #define LED_BLINK_PERIOD K_MSEC(120)
 
-static atomic_t led0_active; /* FromRadio activity (FROMNUM polls) */
-static atomic_t led1_active; /* ToRadio activity (writes) */
+static atomic_t led_fromradio_active; /* FromRadio activity (FROMNUM polls) */
+static atomic_t led_toradio_active;   /* ToRadio activity (writes) */
 
 static void led_blink_tick(const struct gpio_dt_spec *led, atomic_t *active)
 {
@@ -94,8 +97,8 @@ static void led_blink_tick(const struct gpio_dt_spec *led, atomic_t *active)
 static void led_blink_work(struct k_work *work)
 {
     ARG_UNUSED(work);
-    led_blink_tick(&led_ble_0, &led0_active);
-    led_blink_tick(&led_ble_1, &led1_active);
+    led_blink_tick(&led_ble_fromradio, &led_fromradio_active);
+    led_blink_tick(&led_ble_toradio, &led_toradio_active);
     k_work_reschedule(k_work_delayable_from_work(work), LED_BLINK_PERIOD);
 }
 
@@ -140,6 +143,23 @@ struct proxy_conn {
 static struct proxy_conn conns[MAX_BLE_CONNECTIONS];
 static uint8_t           active_conn_count;
 static toradio_cb_t      toradio_handler;
+
+/* --------------------------------------------------- Parsing utilities */
+void uuid_bytes_to_string(const uint8_t *buf, char *out)
+{
+    snprintf(out, 37,
+        "%02x%02x%02x%02x-"
+        "%02x%02x-"
+        "%02x%02x-"
+        "%02x%02x-"
+        "%02x%02x%02x%02x%02x%02x",
+        buf[0],  buf[1],  buf[2],  buf[3],
+        buf[4],  buf[5],
+        buf[6],  buf[7],
+        buf[8],  buf[9],
+        buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]
+    );
+}
 
 /* --------------------------------------------------- Connection utilities */
 
@@ -202,7 +222,7 @@ static ssize_t fromnum_read(struct bt_conn *conn, const struct bt_gatt_attr *att
     }
 
     /* Mark FromRadio activity; the blink worker drives the LED. */
-    atomic_set(&led0_active, 1);
+    atomic_set(&led_fromradio_active, 1);
 
     uint32_t val = pc->fromnum;
     return bt_gatt_attr_read(conn, attr, buf, len, offset, &val, sizeof(val));
@@ -325,7 +345,7 @@ static ssize_t toradio_write(struct bt_conn *conn, const struct bt_gatt_attr *at
     LOG_DBG("TORADIO: %d bytes from conn %p", len, (void *)conn);
 
     /* Mark ToRadio activity; the blink worker drives the LED. */
-    atomic_set(&led1_active, 1);
+    atomic_set(&led_toradio_active, 1);
 
     if (toradio_handler) {
         toradio_handler(conn, buf, len);
@@ -471,13 +491,13 @@ int ble_gatt_start_advertising(void)
 int ble_gatt_init(toradio_cb_t cb)
 {
     /* Activity LEDs: start off, toggle on BLE read/write events. */
-    if (gpio_is_ready_dt(&led_ble_0) && gpio_is_ready_dt(&led_ble_1)) {
-        int ret = gpio_pin_configure_dt(&led_ble_0, GPIO_OUTPUT_INACTIVE);
+    if (gpio_is_ready_dt(&led_ble_fromradio) && gpio_is_ready_dt(&led_ble_toradio)) {
+        int ret = gpio_pin_configure_dt(&led_ble_fromradio, GPIO_OUTPUT_INACTIVE);
         if (ret < 0) {
             LOG_ERR("LED0 failed to be configured: %d", ret);
         }
 
-        ret = gpio_pin_configure_dt(&led_ble_1, GPIO_OUTPUT_INACTIVE);
+        ret = gpio_pin_configure_dt(&led_ble_toradio, GPIO_OUTPUT_INACTIVE);
         if (ret < 0) {
             LOG_ERR("LED1 failed to be configured: %d", ret);
         }
@@ -552,8 +572,10 @@ int ble_gatt_register_proxy_id(struct bt_conn *conn, const proxy_id_t *id)
     }
     memcpy(&pc->proxy_id, id, sizeof(proxy_id_t));
     /* Log as null-terminated string (phone number case) */
-    LOG_INF("proxy_id \"%.*s\" registered for slot %ld",
-            PROXY_ID_SIZE, (const char *)id->bytes, (long)(pc - conns));
+    char uuid_str[37]; 
+    uuid_bytes_to_string(id->bytes, uuid_str); 
+    LOG_INF("proxy_id UUID: %s. Register for slot %ld", 
+            uuid_str, (long)(pc - conns)); 
     return 0;
 }
 
