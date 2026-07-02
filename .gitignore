@@ -20,3 +20,6 @@ venv/
 
 # Test scripts
 tests*/
+
+# Extra files 
+readings/
