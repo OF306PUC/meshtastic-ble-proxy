@@ -248,7 +248,7 @@ setup) before settling into a **steady** phase where text messaging flows natura
   runs its `want_config` handshake (config round `69420` → node-DB round `69421`). These
   are state-changing, one-time-per-(boot / connection) flows — the detailed mechanics live
   in the §3a machines.
-- **STEADY** = `OPERATIONAL`: no state changes — the self-loops are the recurring,
+- **STEADY** = `OPERATIONAL (STATE PHONE_ACTIVE)`: no state changes — the self-loops are the recurring,
   event-driven message flows (UART RX callbacks delivering text/telemetry → routed BLE
   notifications; phone writes → UART → mesh; liveness). This is the "stationary" regime.
 
@@ -404,6 +404,92 @@ flowchart TB
 **reads** (per-phone replay) happen on the BT RX thread but only after `cache_is_ready()`
 returns true. `k_work_delayable` (not `k_timer`) is used for the keepalive precisely so
 it runs in work-queue context and may touch the UART safely.
+
+### 5.1 Scheduling and priorities
+
+Neither of the two execution contexts is a thread we create — both come from subsystems and
+run at framework defaults (not overridden in `prj.conf`). Effective priorities below are the
+values actually passed to the scheduler; `CONFIG_BT_RX_PRIO` / `CONFIG_BT_HCI_TX_PRIO` are
+wrapped in `K_PRIO_COOP(n) = -CONFIG_NUM_COOP_PRIORITIES + n` (here `-16 + n`), so the
+Kconfig *number* is not the priority. (Verified against the resolved `build/zephyr/.config`
+for NCS v2.7.0.)
+
+| Thread / work queue | Origin | Priority knob | Effective prio | Class |
+|---|---|---|---|---|
+| BT HCI TX | BT host (`hci_core.c`) | `CONFIG_BT_HCI_TX_PRIO=7` | `K_PRIO_COOP(7)` = **-9** | cooperative |
+| **BT RX** (`bt_workq`) | BT host, via `CONFIG_BT_RECV_WORKQ_BT=y` | `CONFIG_BT_RX_PRIO=8` | `K_PRIO_COOP(8)` = **-8** | cooperative |
+| System work queue | `k_sys_work_q` (Zephyr core) | `CONFIG_SYSTEM_WORKQUEUE_PRIORITY` | **-1** (raw) | cooperative |
+| `main` | Zephyr core | `CONFIG_MAIN_THREAD_PRIORITY` | **0** | preemptible |
+| BT long work queue (`bt_long_wq`) | BT host (`long_wq.c`) | `CONFIG_BT_LONG_WQ_PRIO=10` | **10** (raw) | preemptible |
+
+The two contexts the data path runs on are **BT RX (`bt_workq`)** and the **system work
+queue**. Because this build selects `CONFIG_BT_RECV_WORKQ_BT` (not `BT_RECV_WORKQ_SYS`), all
+host RX processing — HCI connection events (`on_connected` / `on_disconnected`), ATT
+read/write handlers (`fromradio_read` / `toradio_write`), and CCC subscription-change
+callbacks — runs on the single `bt_workq` thread. They are callbacks on one work queue, not
+separate threads; that serialization is what backs the single-reader-context invariant
+above. Had `BT_RECV_WORKQ_SYS` been chosen instead, this processing would land on
+`k_sys_work_q`, collapsing the two contexts into one.
+
+Zephyr's scheduler is **strictly priority-based**, not fair-share: the single
+highest-priority ready thread runs. Lower number = higher priority. Priorities split into
+two bands — **cooperative** (negative; never preempted, never time-sliced, run until they
+yield or block) and **preemptible** (non-negative). So **BT RX (-8) is *higher* priority
+than the system work queue (-1)**: when both are ready, host RX processing (including phone
+reads) is picked first, ahead of UART frame assembly / TX draining. That ordering is the BT
+stack's default and the right one — the link layer is latency-sensitive.
+
+**Why this is starvation-free without any tuning.** Both threads are event-driven and
+**run-to-completion, then block** — neither ever hogs the CPU:
+
+- Every system-work-queue handler is non-blocking: queue ops are `K_NO_WAIT`, `uart_tx()` is
+  async/DMA, no busy loops or `k_sleep`. Each item runs in microseconds and the thread
+  idles.
+- The BT RX thread's only blocking call is `k_mutex_lock(&pc->lock, K_FOREVER)` around a
+  `memcpy` from the cache arena — microseconds of hold time.
+
+Because both are cooperative and short, neither can starve the other: whoever runs drains
+its work and blocks, handing the CPU back. The one cross-context interaction is `pc->lock`,
+taken on **both** sides (BT RX in `fromradio_read`; the system work queue when the router
+enqueues to a conn). Zephyr mutexes carry **priority inheritance**, so if the system work
+queue (-1) holds the lock while the higher-priority BT RX (-8) wants it, the holder is
+briefly boosted to -8 — no priority inversion.
+
+> **Round-robin / time-slicing does not apply here.** `CONFIG_TIMESLICING` only rotates
+> *preemptible* threads that share the *same* priority. The two data-path contexts are
+> cooperative and at different priorities, so time-slicing is a no-op for them — and making
+> the BT RX thread preemptible would risk link-layer timing. The serialized single-writer
+> model above, not the scheduler, is what guarantees correctness.
+
+**Tuning levers (none needed today; listed for future reference):**
+
+| Lever | Config / API | When to reach for it |
+|---|---|---|
+| Relative priority | `CONFIG_SYSTEM_WORKQUEUE_PRIORITY` vs `CONFIG_BT_RX_PRIO` | Shift who wins when both runnable; only meaningful if a handler becomes long/blocking |
+| Coop ↔ preemptible | work queue prio ≥ 0 | Let BT RX preempt a long work-queue handler — never make BT RX itself preemptible |
+| Dedicated workqueue | `k_work_queue_start()` + own stack/prio | Split TX draining off `k_sys_work_q` if routing/`proto_decode` ever delays TX |
+| Stack sizing | `CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE` (2048) | nanopb decode + router run here — deepest call chain; overflow = hard fault |
+
+**Symptom → likely lever**, should anything regress under load:
+
+- TX frames lag behind a FromRadio burst → routing and TX share one queue → **dedicated TX
+  workqueue** (not a priority change).
+- UART RX/TX work lags while BLE is busy → BT RX (-8) outranks the system work queue (-1),
+  so a long BT RX handler delays UART work → don't lower BT RX; instead move UART work to a
+  **dedicated workqueue at a priority above -1** (e.g. `K_PRIO_COOP`-level) if it must win.
+- Random hard fault during the config phase → suspect **work-queue stack** → bump
+  `CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE`; confirm with `CONFIG_THREAD_ANALYZER=y`.
+- A handler that needs to `k_sleep`/block → breaks the "never blocks" invariant → move it to
+  its own workqueue.
+
+To turn future tuning into a data-driven decision, enable the thread analyzer temporarily —
+it logs per-thread stack high-water marks and CPU usage:
+
+```
+CONFIG_THREAD_ANALYZER=y
+CONFIG_THREAD_ANALYZER_AUTO=y
+CONFIG_THREAD_ANALYZER_AUTO_INTERVAL=30
+```
 
 ---
 
