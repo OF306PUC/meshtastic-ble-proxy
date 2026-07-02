@@ -1,4 +1,4 @@
-# Channel settings 
+# Channel settings
 CHANNEL_BASE_NAME = "EasterNet" 
 NUM_CHANNELS = 8
 
@@ -10,7 +10,7 @@ LORA_PRESET = "LONG_FAST"
 REBROADCAST_MODE = "LOCAL_ONLY"
 
 # Enable Bluetooth: 
-BLUETOOTH_ENABLE = True
+BLUETOOTH_ENABLE = False
 
 # Telemetry settings
 TELEMETRY_DEV_MEAS_ENABLED = True
