@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /*
  * Proxy application-layer protocol
@@ -92,5 +93,26 @@ bool proxy_id_is_zero(const proxy_id_t *id);
 /* Populate a proxy_id_t from a null-terminated string (phone number, etc.).
  * Strings longer than PROXY_ID_SIZE - 1 are truncated. */
 void proxy_id_from_str(proxy_id_t *id, const char *str);
+
+/* Buffer sizes for the string renderers below (include the null terminator). */
+#define PROXY_ID_STR_SIZE       37U    /* canonical UUID "8-4-4-4-12" + '\0'    */
+#define PROXY_HEADER_STR_SIZE   128U   /* "[v01][src=..][dst=..][content=N B]"  */
+
+/*
+ * Render a 16-byte proxy_id as a canonical UUID string (8-4-4-4-12) — the phone
+ * install-id encoding the Android client registers via NODE_REG. `out` must be
+ * at least PROXY_ID_STR_SIZE bytes. Always null-terminates. Returns `out`.
+ */
+const char *proxy_id_to_str(const proxy_id_t *id, char *out, size_t out_size);
+
+/*
+ * Render a parsed proxy header as one human-readable line mirroring the wire
+ * layout [version][src_id][dst_id][content] — as text, NOT a hexdump:
+ *   "[v01][src=<uuid>][dst=<uuid>][content=<N> B]"
+ * `out` must be at least PROXY_HEADER_STR_SIZE bytes. Always null-terminates.
+ * Returns `out`.
+ */
+const char *proxy_header_to_str(const struct proxy_header *hdr,
+                                char *out, size_t out_size);
 
 #endif /* PROXY_PROTOCOL_H */

@@ -114,6 +114,17 @@ int proto_decode_toradio(const uint8_t *buf, uint16_t len,
         break;
     default:
         /* packet / disconnect / xmodem / mqtt / empty — caller forwards. */
+        if (s_toradio.which_payload_variant == meshtastic_ToRadio_packet_tag &&
+            s_toradio.packet.which_payload_variant ==
+                meshtastic_MeshPacket_decoded_tag) {
+            /* Decoded phone->radio packet: expose portnum + payload so the
+             * forward path can trace the proxy wire header. Bytes are still
+             * forwarded verbatim by the caller. */
+            out->is_packet     = true;
+            out->portnum       = s_toradio.packet.decoded.portnum;
+            out->payload_bytes = s_toradio.packet.decoded.payload.bytes;
+            out->payload_len   = (uint16_t)s_toradio.packet.decoded.payload.size;
+        }
         LOG_DBG("ToRadio variant=%d (passthrough)",
                 s_toradio.which_payload_variant);
         break;

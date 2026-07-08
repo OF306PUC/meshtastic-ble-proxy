@@ -38,6 +38,7 @@
 #include "ble_gatt.h"
 #include "config_cache.h"
 #include "proto_handler.h"
+#include "route_trace.h"
 #include "upstream_session.h"
 
 #include <string.h>
@@ -63,7 +64,7 @@ LOG_MODULE_REGISTER(ble_gatt, LOG_LEVEL_DBG);
 #define BT_UUID_LOGRADIO_VAL \
     BT_UUID_128_ENCODE(0x5a3d6e49, 0x06e6, 0x4423, 0x9944, 0xe9de8cdf9547)
 #define BT_UUID_NODE_REG_VAL \
-    BT_UUID_128_ENCODE(0x12345678, 0x0001, 0x0001, 0x0001, 0x000000000001)
+    BT_UUID_128_ENCODE(0x6ba10001, 0x15a8, 0x461f, 0x9fa8, 0x5dcae273eafd)
 
 static struct bt_uuid_128 uuid_meshtastic_svc = BT_UUID_INIT_128(BT_UUID_MESHTASTIC_SVC_VAL);
 static struct bt_uuid_128 uuid_fromnum        = BT_UUID_INIT_128(BT_UUID_FROMNUM_VAL);
@@ -143,23 +144,6 @@ struct proxy_conn {
 static struct proxy_conn conns[MAX_BLE_CONNECTIONS];
 static uint8_t           active_conn_count;
 static toradio_cb_t      toradio_handler;
-
-/* --------------------------------------------------- Parsing utilities */
-void uuid_bytes_to_string(const uint8_t *buf, char *out)
-{
-    snprintf(out, 37,
-        "%02x%02x%02x%02x-"
-        "%02x%02x-"
-        "%02x%02x-"
-        "%02x%02x-"
-        "%02x%02x%02x%02x%02x%02x",
-        buf[0],  buf[1],  buf[2],  buf[3],
-        buf[4],  buf[5],
-        buf[6],  buf[7],
-        buf[8],  buf[9],
-        buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]
-    );
-}
 
 /* --------------------------------------------------- Connection utilities */
 
@@ -299,6 +283,8 @@ static ssize_t fromradio_read(struct bt_conn *conn, const struct bt_gatt_attr *a
             pc->staged_len = pkt->len;
             pc->head       = (pc->head + 1) % FROMRADIO_QUEUE_DEPTH;
             pc->count--;
+            ROUTE_TRACE("ROUTE DN  ble->phone: serve %u B to slot %ld (%u queued left)",
+                    (unsigned)pkt->len, (long)(pc - conns), (unsigned)pc->count);
         } else {
             pc->staged_len = 0;  /* Empty response signals queue drained. */
         }
@@ -342,7 +328,7 @@ static ssize_t toradio_write(struct bt_conn *conn, const struct bt_gatt_attr *at
     if (offset != 0) {
         return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
     }
-    LOG_DBG("TORADIO: %d bytes from conn %p", len, (void *)conn);
+    ROUTE_TRACE("ROUTE UP  phone->ble: TORADIO %d B from conn %p", len, (void *)conn);
 
     /* Mark ToRadio activity; the blink worker drives the LED. */
     atomic_set(&led_toradio_active, 1);
@@ -544,8 +530,13 @@ int ble_gatt_enqueue_fromradio(struct bt_conn *conn, const uint8_t *data, uint16
     /* Notify the routed contact (phone). Zephyr checks CCC internally and drops if not subscribed. */
     int err = bt_gatt_notify(conn, &meshtastic_svc.attrs[FROMNUM_ATTR_IDX],
                              &fromnum_val, sizeof(fromnum_val));
+    
     if (err) {
         LOG_WRN("FROMNUM notify failed: %d", err);
+    } else {
+        char proxy_id_str[PROXY_ID_STR_SIZE];   
+        LOG_INF("FROMNUM notification to=%s. proxy_connection.fromnum=%d", 
+            proxy_id_to_str(&pc->proxy_id, proxy_id_str, sizeof(proxy_id_str)), fromnum_val); 
     }
 
     return 0;
@@ -571,11 +562,9 @@ int ble_gatt_register_proxy_id(struct bt_conn *conn, const proxy_id_t *id)
         return -ENOENT;
     }
     memcpy(&pc->proxy_id, id, sizeof(proxy_id_t));
-    /* Log as null-terminated string (phone number case) */
-    char uuid_str[37]; 
-    uuid_bytes_to_string(id->bytes, uuid_str); 
-    LOG_INF("proxy_id UUID: %s. Register for slot %ld", 
-            uuid_str, (long)(pc - conns)); 
+    char uuid_str[PROXY_ID_STR_SIZE];
+    LOG_INF("proxy_id UUID: %s. Register for slot %ld",
+            proxy_id_to_str(id, uuid_str, sizeof(uuid_str)), (long)(pc - conns));
     return 0;
 }
 
@@ -592,6 +581,7 @@ int ble_gatt_broadcast_fromradio(const uint8_t *data, uint16_t len)
             }
         }
     }
+    ROUTE_TRACE("ROUTE DN  ble->phone: broadcast %u B -> %d phone(s)", (unsigned)len, sent);
     return sent;  /* number of connections that received the packet */
 }
 

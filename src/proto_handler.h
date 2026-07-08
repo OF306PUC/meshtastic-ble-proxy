@@ -52,6 +52,16 @@ struct toradio_info {
     bool      has_want_config;  /* which_payload_variant == want_config_id_tag */
     uint32_t  want_config_id;   /* the phone's config nonce — valid iff above  */
     bool      has_heartbeat;    /* which_payload_variant == heartbeat_tag      */
+
+    /* Decoded MeshPacket payload (phone -> radio real packet). Valid only when
+     * is_packet == true; payload_bytes points into proto_handler's internal
+     * static buffer (valid until the next proto_decode_toradio call). Exposed
+     * so the forward path can inspect the proxy header for tracing without
+     * re-decoding — the bytes are still forwarded to UART verbatim. */
+    bool      is_packet;        /* packet variant AND decoded (not encrypted)  */
+    uint32_t  portnum;          /* Data.portnum — valid when is_packet          */
+    const uint8_t *payload_bytes; /* Data.payload.bytes — valid when is_packet */
+    uint16_t  payload_len;      /* Data.payload.size  — valid when is_packet    */
 };
 
 /*

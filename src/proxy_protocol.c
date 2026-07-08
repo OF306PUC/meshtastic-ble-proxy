@@ -6,6 +6,7 @@
 
 #include "proxy_protocol.h"
 #include <string.h>
+#include <stdio.h>
 
 bool proxy_header_parse(const uint8_t *payload, uint16_t len,
                         struct proxy_header *out)
@@ -78,4 +79,46 @@ void proxy_id_from_str(proxy_id_t *id, const char *str)
         len = PROXY_ID_SIZE;
     }
     memcpy(id->bytes, str, len);
+}
+
+const char *proxy_id_to_str(const proxy_id_t *id, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0U) {
+        return out;
+    }
+    if (id == NULL) {
+        snprintf(out, out_size, "(null)");
+        return out;
+    }
+
+    const uint8_t *b = id->bytes;
+    /* Canonical UUID grouping (8-4-4-4-12) over the raw big-endian bytes. */
+    snprintf(out, out_size,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+             b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    return out;
+}
+
+const char *proxy_header_to_str(const struct proxy_header *hdr,
+                                char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0U) {
+        return out;
+    }
+    if (hdr == NULL) {
+        snprintf(out, out_size, "(null)");
+        return out;
+    }
+
+    char src[PROXY_ID_STR_SIZE];
+    char dst[PROXY_ID_STR_SIZE];
+    proxy_id_to_str(&hdr->src, src, sizeof(src));
+    proxy_id_to_str(&hdr->dst, dst, sizeof(dst));
+
+    /* Mirrors the wire layout [version][src_id][dst_id][content] as text.
+     * Version is fixed (parse only accepts PROXY_VERSION), so report it. */
+    snprintf(out, out_size, "[v%02x][src=%s][dst=%s][content=%u B]",
+             (unsigned)PROXY_VERSION, src, dst, (unsigned)hdr->content_len);
+    return out;
 }

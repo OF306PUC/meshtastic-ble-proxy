@@ -30,6 +30,7 @@
 #include "ble_gatt.h"
 #include "proxy_protocol.h"
 #include "upstream_session.h"
+#include "route_trace.h"
 
 #include "meshtastic/mesh.pb.h"   /* meshtastic_FromRadio_packet_tag */
 #include <zephyr/logging/log.h>
@@ -39,6 +40,13 @@ LOG_MODULE_REGISTER(router, LOG_LEVEL_DBG);
 void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
                      const struct fromradio_info *info)
 {
+    ROUTE_TRACE("ROUTE DN  decode: variant=%d from=0x%08x to=0x%08x decoded=%d port=%u paylen=%u",
+                info->which_variant, info->packet_from, info->packet_to,
+                (int)info->is_decoded, info->portnum, (unsigned)info->payload_len);
+    if (info->is_decoded && info->payload_len) {
+        ROUTE_TRACE_HEXDUMP(info->payload_bytes, info->payload_len, "ROUTE DN payload");
+    }
+
     /* ----------------------------------------------------------------
      * Upstream config-fetch window: while the proxy is consuming its
      * own boot config burst, config/meta variants are CONSUMED into the cache
@@ -65,7 +73,7 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
             LOG_DBG("keepalive queueStatus swallowed (not broadcast)");
             return;
         }
-        LOG_DBG("variant %d (config/meta) → broadcast", info->which_variant);
+        ROUTE_TRACE("ROUTE DN  route: variant %d (config/meta) -> broadcast", info->which_variant);
         ble_gatt_broadcast_fromradio(raw_bytes, len);
         return;
     }
@@ -75,7 +83,7 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
      * Encrypted packets cannot be inspected; broadcast as fallback.
      * ---------------------------------------------------------------- */
     if (!info->is_decoded) {
-        LOG_DBG("0x%08x→0x%08x encrypted → broadcast",
+        ROUTE_TRACE("ROUTE DN  route: 0x%08x->0x%08x encrypted -> broadcast",
                 info->packet_from, info->packet_to);
         ble_gatt_broadcast_fromradio(raw_bytes, len);
         return;
@@ -95,12 +103,18 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
             return;
         }
 
+#if IS_ENABLED(CONFIG_MESHTASTIC_ROUTE_TRACE)
+        {
+            char wire[PROXY_HEADER_STR_SIZE];
+            ROUTE_TRACE("ROUTE DN  wire: %s",
+                        proxy_header_to_str(&hdr, wire, sizeof(wire)));
+        }
+#endif
+
         struct bt_conn *conn = ble_gatt_get_conn_by_proxy_id(&hdr.dst);
         if (conn != NULL) {
-            LOG_DBG("proxy: src=\"%.16s\" dst=\"%.16s\" → targeted (%u B)",
-                    (const char *)hdr.src.bytes,
-                    (const char *)hdr.dst.bytes,
-                    len);
+            ROUTE_TRACE("ROUTE DN  route: proxy dst matched -> targeted conn %p (%u B)",
+                    (void *)conn, (unsigned)len);
             ble_gatt_enqueue_fromradio(conn, raw_bytes, len);
         } else {
             /*
@@ -108,8 +122,9 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
              * Broadcast so the message isn't silently dropped. Once the target
              * phone connects and calls NODE_REG, subsequent messages are targeted.
              */
-            LOG_DBG("proxy: dst=\"%.16s\" not registered → broadcast fallback",
-                    (const char *)hdr.dst.bytes);
+            char dststr[PROXY_ID_STR_SIZE];
+            LOG_DBG("proxy: dst=%s not registered -> broadcast fallback",
+                    proxy_id_to_str(&hdr.dst, dststr, sizeof(dststr)));
             ble_gatt_broadcast_fromradio(raw_bytes, len);
         }
         return;
@@ -117,7 +132,7 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
 
     /* Standard Meshtastic portnum (TEXT_MESSAGE, POSITION, TELEMETRY, etc.)
      * → broadcast to all connected phones. The app filters what it needs. */
-    LOG_DBG("portnum=%u from=0x%08x → broadcast (standard traffic)",
+    ROUTE_TRACE("ROUTE DN  route: portnum=%u from=0x%08x -> broadcast (standard traffic)",
             info->portnum, info->packet_from);
     ble_gatt_broadcast_fromradio(raw_bytes, len);
 }

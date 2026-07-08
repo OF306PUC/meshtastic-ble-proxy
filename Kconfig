@@ -1,0 +1,36 @@
+# =============================================================================
+# Meshtastic BLE Proxy — application Kconfig
+#
+# Providing an app-level Kconfig makes this file the Kconfig *root* for the
+# build, so it MUST source the Zephyr Kconfig tree at the end (otherwise all
+# CONFIG_BT_*, CONFIG_LOG_*, etc. disappear).
+# =============================================================================
+
+menu "Meshtastic BLE Proxy"
+
+config MESHTASTIC_ROUTE_TRACE
+	bool "Enable ROUTE message-path tracing logs"
+	default n
+	help
+	  Emit per-hop "ROUTE UP/DN ..." INFO logs that trace a message across
+	  the proxy (BLE <-> UART): the phone write, the routing decision, the
+	  UART TX/RX, and the per-phone serve. Useful for debugging the
+	  end-to-end path during bring-up and testing.
+
+	  This adds processing time on the packet hot path. When disabled, the
+	  trace calls compile out entirely (zero overhead) — leave it off for
+	  production builds and enable it only while debugging.
+
+config MESHTASTIC_ROUTE_TRACE_PAYLOAD
+	bool "Also hexdump packet payloads in ROUTE traces"
+	depends on MESHTASTIC_ROUTE_TRACE
+	default n
+	help
+	  In addition to the ROUTE path logs, hexdump the raw ToRadio bytes
+	  (uplink) and the decoded FromRadio Data.payload (downlink). The
+	  hexdump's ASCII column reveals text-message content. More verbose and
+	  slower — enable only when you need to see the actual message bytes.
+
+endmenu
+
+source "Kconfig.zephyr"

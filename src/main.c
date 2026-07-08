@@ -6,6 +6,8 @@
 #include "proto_handler.h"
 #include "router.h"
 #include "upstream_session.h"
+#include "proxy_protocol.h"
+#include "route_trace.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -42,8 +44,12 @@ static void on_fromradio_uart(const uint8_t *payload, uint16_t len)
  *                      NEVER forwarded to UART — forwarding it would restart the
  *                      node's single global config session and clobber every
  *                      other phone's in-flight handshake.
- *   - heartbeat      : swallowed locally (Task D adds the reactive queueStatus
- *                      reply later). NEVER forwarded to UART.
+ *   - heartbeat      : absorbed locally — answered with a synthesized
+ *                      queueStatus for liveness; NEVER forwarded to UART. The
+ *                      node's serial link is kept alive by the proxy's own
+ *                      keepalive, and delivery of inbound FromRadio is driven by
+ *                      the node's push (not by client ToRadio), so forwarding
+ *                      heartbeats is unnecessary.
  *   - anything else  : a real packet → forwarded to the node via UART as today.
  *
  * On decode failure we forward the raw bytes best-effort (no silent drop).
@@ -85,7 +91,18 @@ static void on_toradio_ble(struct bt_conn *conn, const uint8_t *data, uint16_t l
 
     /* Real packet → forward to the node, and push the upstream keepalive out
      * the keepalive only fires after a stretch of true silence. */
-    LOG_INF("ToRadio: %d bytes from conn %p → UART", len, (void *)conn);
+    ROUTE_TRACE("ROUTE UP  ble->node: ToRadio %d B from conn %p -> UART", len, (void *)conn);
+    ROUTE_TRACE_HEXDUMP(data, len, "ROUTE UP payload");
+#if IS_ENABLED(CONFIG_MESHTASTIC_ROUTE_TRACE)
+    if (ti.is_packet && ti.portnum == PROXY_PORTNUM) {
+        struct proxy_header hdr;
+        if (proxy_header_parse(ti.payload_bytes, ti.payload_len, &hdr)) {
+            char wire[PROXY_HEADER_STR_SIZE];
+            ROUTE_TRACE("ROUTE UP  wire: %s",
+                        proxy_header_to_str(&hdr, wire, sizeof(wire)));
+        }
+    }
+#endif
     int err = uart_meshtastic_tx(data, len);
     if (err == -ENOMEM) {
         LOG_WRN("TX queue full — ToRadio from conn %p dropped", (void *)conn);
