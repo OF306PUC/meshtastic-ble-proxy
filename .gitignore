@@ -21,5 +21,9 @@ venv/
 # Test scripts
 tests*/
 
-# Extra files 
+# Extra files
 readings/
+
+# Local capture/diagnosis logs (node + proxy traces) — kept local, never committed
+txrx.txt
+rxtx.txt
