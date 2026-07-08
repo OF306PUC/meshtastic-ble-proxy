@@ -209,6 +209,27 @@ hops, PKI, priority) rides through untouched. Note the proxy's per-phone `DST_ID
 Meshtastic node-level address; `DST_ID` is the proxy address layered on via
 `PROXY_PORTNUM (256)`.
 
+The table below lists the `portnum` values the proxy actually sees on the link — the one it
+**routes on** (`PRIVATE_APP` = 256) plus the standard Meshtastic apps the node emits and the
+proxy passes through. `PRIVATE_APP (256)` is the **only** value the router branches on
+(`router.c:95`); every other portnum is broadcast to all connected phones. Highlighted rows
+are the everyday traffic — user text and, when telemetry is configured, the node's periodic
+metrics.
+
+| `portnum` (number) | `PortNum` proto name | Usage / how the proxy treats it |
+|---|---|---|
+| **256** | **`PRIVATE_APP`** (= `PROXY_PORTNUM`) | **Targeted unicast — the only routed portnum.** The proxy header lives inside `Data.payload`; the frame is delivered only to the phone whose registered `proxy_id` matches `DST_ID` (broadcast fallback if the header is bad or `DST_ID` unregistered). |
+| **1** | **`TEXT_MESSAGE_APP`** | **User chat text** (UTF-8 in `Data.payload`) — the most common *user-initiated* traffic. Broadcast to every phone; the stock app displays it. |
+| **67** | **`TELEMETRY_APP`** | **Node metrics** (device / environment / power). When telemetry is enabled the node emits these **periodically and unprompted**, making them the most common *node-initiated* traffic on the link. Broadcast to all phones. |
+| 3 | `POSITION_APP` | Node GPS position — periodic when position reporting is configured. Broadcast. |
+| 4 | `NODEINFO_APP` | Node identity / user record (long+short name, hardware). Broadcast; also part of the boot config burst cached during `FETCHING`. |
+| 5 | `ROUTING_APP` | Mesh ACKs / routing control. Broadcast. |
+| `0`, `2`–`255`, `257`–`511` | e.g. `WAYPOINT_APP` (8), `TRACEROUTE_APP` (70), `NEIGHBORINFO_APP` (71) | Broadcast, transparent passthrough — the proxy never branches on these individually. |
+| — | *encrypted / not decoded* | portnum is unreadable → broadcast raw bytes (never dropped). |
+
+On the uplink (`ToRadio`) path the proxy forwards real packets **verbatim regardless of
+portnum**; portnum-based routing applies only to downlink `FromRadio` frames.
+
 ---
 
 ## 3. State machines
@@ -313,7 +334,7 @@ sequenceDiagram
 
     Note over P,N: Steady state (LIVE)
     P->>BG: ToRadio{heartbeat}
-    BG-->>P: synthesized queueStatus (liveness)
+    BG-->>P: synthesized queueStatus (liveness, handled locally)
     P->>BG: ToRadio{mesh packet}
     BG->>U: forward → node → mesh
 ```
@@ -372,33 +393,45 @@ release/acquire barrier (`cache_mark_ready` / `cache_is_ready`), so no mutex is 
 for the read-only cache. The per-connection FROMRADIO queue is guarded by a per-`conn`
 `k_mutex`.
 
-```mermaid
-flowchart TB
-    subgraph SWQ["System work queue (single thread)"]
-        rxw["rx_work: UART RX → frame assembly"]
-        onfr["on_fromradio_uart → proto_decode → router_dispatch"]
-        txw["tx_work: drain TX queue → uart_tx"]
-        kaw["keepalive_work (k_work_delayable, ~5 min)"]
-        rxw --> onfr
-    end
+<p align="center">
+  <img src="figs/threading-model.svg" alt="Zephyr threading model: the system work queue and the Bluetooth RX thread, the work items each runs, the TX message queue that bridges them, and the atomically-published config_cache" width="65%">
+</p>
 
-    subgraph BTRX["Bluetooth RX thread"]
-        tw["toradio_write → on_toradio_ble<br/>(want_config / heartbeat / packet)"]
-        fr["fromradio_read (serve-on-read replay / queue)"]
-        ccc["CCC + connected/disconnected"]
-    end
+<p align="center"><em>Figure 5 — the two Zephyr execution contexts under the RTOS scheduler: the work items each runs, and the data that moves between them (the TX message queue, and the atomically-published <code>config_cache</code>). Effective thread priorities are in §5.1.</em></p>
 
-    cache[("config_cache<br/>read-only after ready")]
-    onfr -- writes (FETCHING) --> cache
-    fr -- reads (replay) --> cache
-    onfr -. "atomic publish" .-> fr
+Both boxes are contexts scheduled **cooperatively** by the Zephyr RTOS scheduler (§5.1 for
+the priority numbers). The components in each:
 
-    tw -- "mesh packet" --> txw
-    kaw -- "ToRadio.heartbeat" --> txw
+**System work queue (single thread)** — Zephyr's `k_sys_work_q`. It runs four work items:
+- `uart_rx_work()` — UART1 RX → Stream-API **frame assembly**;
+- the decode/route chain `on_fromradio_uart()` → `proto_decode()` → `router_dispatch()`;
+- `uart_tx_work()` — **drains the TX UART queue** into `uart_tx()` (async/DMA);
+- `uart_keepalive_work()` — a `k_work_delayable` that fires ~every 5 min.
 
-    classDef store fill:#fde9c8,stroke:#b7791f,color:#3b2f00;
-    class cache store;
-```
+**Bluetooth RX thread** — the `bt_workq` (this build selects `CONFIG_BT_RECV_WORKQ_BT`, §5.1).
+It runs:
+- `toradio_write()` → `on_toradio_ble()`, handling the phone's **received messages**
+  (`ble_heartbeat`, `MeshPacket`);
+- `fromradio_read()` — **drains the per-phone BLE session queue** (serve-on-read replay);
+- the `CCCD + connected/disconnected` callbacks (notification subscription + connection
+  lifecycle — allocate/free the per-phone slot).
+
+**Messages and data movement between the contexts:**
+
+- **ToRadio (phone → mesh).** On the BT RX thread, `on_toradio_ble()` turns a phone write into
+  a `MeshPacket` and puts it on the **message queue** — a Zephyr `k_msgq` (`tx_msgq`),
+  the diagram's `MeshPacket` → *Message Queue* edge. The system work queue's `uart_tx_work()`
+  drains that queue to UART. This `k_msgq` is the **only** place the two threads exchange live
+  packets, and it is the thread-safe handoff that makes the cross-context boundary explicit.
+  `uart_keepalive_work()` feeds the same drain with a `ToRadio.heartbeat`.
+- **FromRadio (mesh → phone).** `uart_rx_work()` assembles a frame; `on_fromradio_uart()`
+  decodes it and `router_dispatch()` either **writes** it into `config_cache` (while the node
+  is `FETCHING`) or, once LIVE, enqueues it to the target phone(s).
+- **Config-cache handoff.** `config_cache` is **read-only after ready**. The system work queue
+  is its sole writer during `FETCHING` (the *Writes / Node FETCHING* edge); the BT RX thread
+  only ever **reads** it, during a phone's `REPLAYING` (the *Read / Phone REPLAYING* edge), and
+  only after the **Atomic Publish** barrier (`cache_mark_ready` / `cache_is_ready`) makes it
+  visible. That release/acquire `atomic_t` is precisely why the cache needs no mutex.
 
 **Invariant:** all cache **writes** happen on the system work queue during `FETCHING`;
 **reads** (per-phone replay) happen on the BT RX thread but only after `cache_is_ready()`
@@ -515,7 +548,7 @@ ready.
 
 | File | Responsibility | Context |
 |---|---|---|
-| `main.c` | Boot order; `on_toradio_ble` (local handling of want_config/heartbeat, forward packets, reschedule keepalive); `on_fromradio_uart` | BT RX + work queue |
+| `main.c` | Boot order; `on_toradio_ble` (want_config from cache, heartbeat absorbed with synth queueStatus, forward packets, reschedule keepalive); `on_fromradio_uart` | BT RX + work queue |
 | `ble_gatt.c/.h` | GATT service (FROMNUM/FROMRADIO/TORADIO/LOGRADIO/NODE_REG), per-phone state, serve-on-read replay, synthesized queueStatus | BT RX |
 | `uart_meshtastic.c/.h` | UART1 async/DMA, Stream API framing (`0x94 0xC3 len_hi len_lo`), RX state machine, TX queue | work queue |
 | `proto_handler.c/.h` | nanopb decode (FromRadio/ToRadio) + encoders (config_complete / heartbeat / queueStatus) | both (stack-local encode) |
@@ -531,7 +564,10 @@ ready.
 - **`cache_mark_ready()` is a release barrier** — readers seeing `cache_is_ready()` see
   the fully-written arena.
 - **Burst order preserved**; `config_complete_id` synthesized per phone, never cached.
-- **want_config / heartbeat never reach UART**; only mesh packets do.
+- **want_config / heartbeat never reach UART** — want_config would restart the node's single
+  global config session; heartbeats are absorbed locally (answered with a synthesized
+  queueStatus for liveness). Inbound FromRadio delivery is driven by the node's own push, not
+  by client ToRadio, so forwarding heartbeats is unnecessary. Only mesh packets are forwarded.
 - **Keepalive** fires only after ~5 min of no real ToRadio (rescheduled on each real TX),
   nonce ≠ 1; its queueStatus reply is swallowed in `router`.
 - **No silent drops** — overflow / unregistered DST_ID fall back to broadcast and log.
