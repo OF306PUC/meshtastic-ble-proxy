@@ -15,6 +15,7 @@
  */
 
 #include "uart_meshtastic.h"
+#include "route_trace.h"
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
@@ -171,7 +172,7 @@ static void rx_process_byte(uint8_t byte)
     case RX_WAIT_PAYLOAD:
         rx_sm.payload[rx_sm.received_len++] = byte;
         if (rx_sm.received_len == rx_sm.expected_len) {
-            LOG_DBG("RX frame complete: %d bytes", rx_sm.received_len);
+            ROUTE_TRACE("ROUTE DN  node->uart: frame %d B from node", rx_sm.received_len);
             if (fromradio_cb) {
                 fromradio_cb(rx_sm.payload, rx_sm.received_len);
             }
@@ -227,6 +228,8 @@ static void tx_work_handler(struct k_work *work)
         tx_in_progress = false;
         /* Drop this entry and try the next one. */
         k_work_submit(work);
+    } else {
+        ROUTE_TRACE("ROUTE UP  uart->node: TX %u B to node", (unsigned)entry.len);
     }
 }
 
@@ -241,6 +244,10 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
     switch (evt->type) {
 
     case UART_RX_RDY:
+        /* Data ready: either the DMA buffer filled, OR (with HW-async byte
+         * counting enabled) the RX line went idle for UART_RX_TIMEOUT_US and the
+         * driver flushed a partial buffer. The latter is what delivers a lone
+         * FromRadio frame promptly instead of stalling until the buffer fills. */
         ring_buf_put(&rx_ring_buf,
                      evt->data.rx.buf + evt->data.rx.offset,
                      evt->data.rx.len);
@@ -255,6 +262,25 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 
     case UART_RX_BUF_RELEASED:
         break;
+
+    case UART_RX_STOPPED:
+        /* RX halted on a bus error (framing / parity / overrun). RX_DISABLED
+         * follows and re-arms reception there. */
+        LOG_WRN("UART RX stopped (reason 0x%x) — will re-enable",
+                (unsigned)evt->data.rx_stop.reason);
+        break;
+
+    case UART_RX_DISABLED: {
+        /* Reception ended (after an error/stop). Re-arm so the link recovers
+         * instead of going silently deaf. */
+        active_buf = 0U;
+        int rerr = uart_rx_enable(dev, dma_buf[active_buf], UART_DMA_BUF_SIZE,
+                                  UART_RX_TIMEOUT_US);
+        if (rerr) {
+            LOG_ERR("UART RX re-enable failed: %d", rerr);
+        }
+        break;
+    }
 
     case UART_TX_DONE:
         tx_in_progress = false;
