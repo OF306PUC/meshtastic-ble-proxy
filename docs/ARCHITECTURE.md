@@ -245,10 +245,10 @@ one wire.
 | Direction | `ToRadio` = nordic → node (writes/packets); `FromRadio` = node → nordic (config burst, mesh packets, telemetry) |
 
 <p align="center">
-  <img src="figs/UARTE-OP.svg" alt="nRF UARTE1 datapath: EasyDMA RX/TX buffers in RAM, RXDRDY→PPI→TIMER2 byte counter, and the k_timer 2 ms idle timeout that emits UART_RX_RDY" width="85%">
+  <img src="figs/UARTE-OP.svg" alt="nRF UARTE1 datapath: EasyDMA RX/TX buffers in RAM, RXDRDY→PPI→TIMER2 byte counter, and the k_timer 2 ms idle timeout that emits UART_RX_RDY" width="70%">
 </p>
 
-<p align="center"><em>Figure 2 — nRF UARTE1 datapath. <strong>RX:</strong> bytes flow RXD line → RX FIFO → EasyDMA → the RX buffer in RAM; each received byte pulses <code>RXDRDY</code>, routed by <strong>PPI</strong> to <strong>TIMER2</strong> in counter mode (it counts <em>bytes</em>, not time). A software <code>k_timer</code> polls that count every 400 µs and, after <strong>2 ms</strong> with no new byte, emits <code>UART_RX_RDY</code> to hand the buffered <code>FromRadio</code> bytes to the app. <strong>TX</strong> mirrors it: <code>ToRadio</code> bytes in the TX buffer → EasyDMA → TX line. See §2c text and <code>docs/uart-dma-rx-latency.es.md</code>.</em></p>
+<p align="center"><em>Figure 2 — nRF UARTE1 datapath. <strong>RX:</strong> bytes flow RXD line → RX FIFO → EasyDMA → the RX buffer in RAM; each received byte pulses <code>RXDRDY</code>, routed by <strong>PPI</strong> to <strong>TIMER2</strong> in counter mode (it counts <em>bytes</em>, not time). A software <code>k_timer</code> polls that count every 400 µs and, after <strong>2 ms</strong> with no new byte, emits <code>UART_RX_RDY</code> to hand the buffered <code>FromRadio</code> bytes to the app. <strong>TX</strong> mirrors it: <code>ToRadio</code> bytes in the TX buffer → EasyDMA → TX line.</em></p>
 
 **nordic-side driver (`uart_meshtastic.c`).** RX and TX both use the Zephyr **async API with
 EasyDMA**, so the CPU is never in the per-byte path:
@@ -261,7 +261,7 @@ EasyDMA**, so the CPU is never in the per-byte path:
   gap. Without this, `UART_RX_RDY` fires only when the 256 B buffer fills, and a lone
   `FromRadio` frame stalls until unrelated later traffic tops the buffer up — coupling
   inbound delivery to outbound sends. `UART_RX_STOPPED`/`UART_RX_DISABLED` re-enable RX so a
-  bus error can't leave the link deaf. (Full write-up: `docs/uart-dma-rx-latency.es.md`.)
+  bus error can't leave the link deaf.
 - **TX:** each outbound packet is queued in a `k_msgq`, and `tx_work` starts one async
   `uart_tx()` at a time (`tx_in_progress` guard), re-armed on `UART_TX_DONE`.
 
@@ -312,7 +312,7 @@ setup) before settling into a **steady** phase where text messaging flows natura
   notifications; phone writes → UART → mesh; liveness). This is the "stationary" regime.
 
 <p align="center">
-  <img src="figs/steady-state.svg" alt="Steady-state operational message flows" width="65%">
+  <img src="figs/steady-state-arch.svg" alt="Steady-state operational message flows" width="65%">
 </p>
 
 <p align="center"><em>Figure 3b — the steady (<code>OPERATIONAL</code>) regime: recurring, event-driven flows once the cache is LIVE and the phone is ACTIVE. (TODO: this figure still omits the broadcast path — node FromRadio fanned out to all connected phones.)</em></p>
