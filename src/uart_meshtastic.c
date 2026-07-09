@@ -42,7 +42,7 @@ LOG_MODULE_REGISTER(uart_meshtastic, LOG_LEVEL_DBG);
  * UART without flow control cannot be stalled by the remote side).
  *
  * Derived from worst-case frame size and baud rate:
- *   byte time = 10 bits (8N1) / 115200 ≈ 87 µs
+ *   byte time = 10 (byte-protocol) bits (8N1) / 115200 ≈ 87 µs
  *   max frame = 4 (header) + MESHTASTIC_MAX_PAYLOAD bytes
  *   max TX time ≈ 516 × 87 µs ≈ 45 ms
  *   2× safety margin → ~90 ms
