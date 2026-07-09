@@ -85,6 +85,56 @@ maneras:
 HW-async apagado el vaciado por idle no ocurría, así que `UART_RX_RDY` quedaba condicionado
 al buffer lleno.**
 
+## 3b. Dos "relojes" distintos: el contador de bytes (TIMER) y el reloj de inactividad (k_timer)
+
+<p align="center">
+  <img src="figs/UARTE-OP.svg" alt="Datapath del UARTE1 de nRF: buffers EasyDMA RX/TX en RAM, contador de bytes RXDRDY→PPI→TIMER2, y el k_timer de 2 ms que emite UART_RX_RDY" width="85%">
+</p>
+
+<p align="center"><em>Figura — Datapath del UARTE1. <strong>RX:</strong> los bytes van RXD line → RX FIFO → EasyDMA → buffer de RX en RAM; cada byte recibido pulsa <code>RXDRDY</code>, que vía <strong>PPI</strong> incrementa <strong>TIMER2</strong> en modo contador (cuenta <em>bytes</em>, no tiempo). Un <code>k_timer</code> de software lee ese contador cada 400 µs y, tras <strong>2 ms</strong> sin bytes nuevos, emite <code>UART_RX_RDY</code> para entregarle los bytes <code>FromRadio</code> a la aplicación. <strong>TX</strong> es simétrico: los bytes <code>ToRadio</code> del buffer de TX → EasyDMA → línea TX.</em></p>
+
+Un punto que confunde: **el TIMER que habilitamos NO mide tiempo.** Hay dos mecanismos
+separados y cada uno responde una pregunta distinta:
+
+| Componente | Qué es | Pregunta que responde | ¿Mide tiempo? |
+|---|---|---|---|
+| **TIMER2** | Periférico HW en modo **COUNTER** (`NRF_TIMER_MODE_COUNTER`) | *"¿cuántos bytes llevo en el buffer?"* | **No** — cuenta eventos |
+| **`rx_timeout_timer`** | Un **`k_timer` de software** (kernel de Zephyr) | *"¿hace cuánto que no llega ningún byte?"* | **Sí** |
+
+- **TIMER2 (el "cuántos").** Está cableado en **modo contador**, no de tiempo. Vía **PPI**,
+  cada evento `RXDRDY` del UARTE (uno por byte recibido) dispara la tarea `COUNT` del timer,
+  así que el timer se incrementa por hardware, sin CPU. Se necesita porque EasyDMA no revela
+  el conteo hasta que **termina** (`ENDRX` = buffer lleno); para entregar un buffer *parcial*
+  el driver necesita saber cuántos bytes hay **ahora**.
+
+- **`k_timer` (el "hace cuánto").** Éste sí mide tiempo. El driver divide el timeout en
+  `RX_TIMEOUT_DIV = 5` tramos: `rx_timeout_slab = 2000 µs / 5 = 400 µs`. Cada 400 µs el
+  `k_timer` lee el contador de TIMER2 y:
+  - si **cambió** (siguen llegando bytes) → resetea; estamos en medio de una trama, no hay flush;
+  - si **no cambió** → resta 400 µs al tiempo restante; al acumular 2 ms **quieto** →
+    concluye "línea inactiva" → **flush** (`UART_RX_RDY`).
+
+**La aritmética del umbral** (no la mide el TIMER; sirve para entenderlo). A 115200 baudios:
+
+```
+tiempo de bit  = 1 / 115200                         ≈ 8.68 µs
+byte en el cable (8N1 = 1 start + 8 datos + 1 stop) ≈ 86.8 µs   (10 bits)
+umbral de idle = 2 ms / 86.8 µs                     ≈ 23 bytes
+```
+
+Es decir, "inactivo" = **~23 tiempos-de-byte sin recibir nada**. Dentro de una trama los
+bytes llegan pegados (~87 µs) y el contador nunca se congela, así que jamás se corta a mitad
+de trama; el flush cae en el **borde** de la trama.
+
+**Qué es "flush" exactamente.** Los bytes ya están en RAM (EasyDMA los escribe uno a uno al
+llegar). El timeout ejecuta `STOPRX`, que además **drena el pequeño FIFO interno de HW** del
+UARTE a RAM y fija el conteo final (`RXD.AMOUNT`), emite `UART_RX_RDY(offset, len)` para
+**avisar a la aplicación** (ahí se dispara `rx_process_byte`) y reinicia la recepción. O sea:
+flush ≈ **notificar + drenar el FIFO**, no mover el grueso de los datos.
+
+> Resumen: **TIMER2 responde *"¿cuántos?"*; el `k_timer` responde *"¿hace cuánto?"*.** Sin
+> `HW_ASYNC`, ese conteo/flush no era fiable, y `UART_RX_RDY` sólo salía por buffer lleno.
+
 ## 4. Por qué el "tráfico de retorno" llena el buffer de RX (la parte confusa)
 
 Esto es lo clave y lo menos intuitivo. **El buffer de RX DMA es UN solo buffer contiguo que

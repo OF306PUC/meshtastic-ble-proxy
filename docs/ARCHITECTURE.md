@@ -230,6 +230,44 @@ metrics.
 On the uplink (`ToRadio`) path the proxy forwards real packets **verbatim regardless of
 portnum**; portnum-based routing applies only to downlink `FromRadio` frames.
 
+### 2c. The UART link (Meshtastic node ↔ nordic)
+
+The nordic talks to the LILYGO node over **UART1** as a Meshtastic **Stream-API client** —
+i.e. the nordic looks to the node exactly like a phone on a serial cable would. The node's
+own Bluetooth is disabled (`param_node.py`); all phone traffic reaches the node through this
+one wire.
+
+| Property | Value |
+|---|---|
+| Pins (`boards/…overlay`) | `P1.02` → TX (to node RX), `P1.01` → RX (from node TX) |
+| Line | **115200** baud, 8N1, no flow control (~86.8 µs per 10-bit byte) |
+| Framing (Stream API) | `[0x94][0xC3][len_hi][len_lo][protobuf]` — 4-byte header + big-endian 16-bit length; payload is a `ToRadio`/`FromRadio` protobuf |
+| Direction | `ToRadio` = nordic → node (writes/packets); `FromRadio` = node → nordic (config burst, mesh packets, telemetry) |
+
+<p align="center">
+  <img src="figs/UARTE-OP.svg" alt="nRF UARTE1 datapath: EasyDMA RX/TX buffers in RAM, RXDRDY→PPI→TIMER2 byte counter, and the k_timer 2 ms idle timeout that emits UART_RX_RDY" width="85%">
+</p>
+
+<p align="center"><em>Figure 2 — nRF UARTE1 datapath. <strong>RX:</strong> bytes flow RXD line → RX FIFO → EasyDMA → the RX buffer in RAM; each received byte pulses <code>RXDRDY</code>, routed by <strong>PPI</strong> to <strong>TIMER2</strong> in counter mode (it counts <em>bytes</em>, not time). A software <code>k_timer</code> polls that count every 400 µs and, after <strong>2 ms</strong> with no new byte, emits <code>UART_RX_RDY</code> to hand the buffered <code>FromRadio</code> bytes to the app. <strong>TX</strong> mirrors it: <code>ToRadio</code> bytes in the TX buffer → EasyDMA → TX line. See §2c text and <code>docs/uart-dma-rx-latency.es.md</code>.</em></p>
+
+**nordic-side driver (`uart_meshtastic.c`).** RX and TX both use the Zephyr **async API with
+EasyDMA**, so the CPU is never in the per-byte path:
+
+- **RX:** double-buffered EasyDMA (2 × 256 B) → a `UART_RX_RDY` chunk is copied into a 1024 B
+  ring buffer, and `rx_work` (system work queue) drains it through the framing state machine
+  (`rx_process_byte`). Because the nRF UARTE has **no hardware idle-line detection**, RX runs
+  in **hardware-async** mode (`CONFIG_UART_1_NRF_HW_ASYNC`, dedicated **TIMER2** counting
+  `RXDRDY` over PPI) so a *partial* DMA buffer is flushed after a **2 ms** inter-byte idle
+  gap. Without this, `UART_RX_RDY` fires only when the 256 B buffer fills, and a lone
+  `FromRadio` frame stalls until unrelated later traffic tops the buffer up — coupling
+  inbound delivery to outbound sends. `UART_RX_STOPPED`/`UART_RX_DISABLED` re-enable RX so a
+  bus error can't leave the link deaf. (Full write-up: `docs/uart-dma-rx-latency.es.md`.)
+- **TX:** each outbound packet is queued in a `k_msgq`, and `tx_work` starts one async
+  `uart_tx()` at a time (`tx_in_progress` guard), re-armed on `UART_TX_DONE`.
+
+Both `rx_work` and `tx_work` run on the system work queue — see §5.1 for how that context is
+scheduled relative to the BT RX thread.
+
 ---
 
 ## 3. State machines
