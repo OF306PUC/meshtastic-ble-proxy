@@ -2,64 +2,15 @@
 
 This document audits the embedded software: module structure, data flow, the two
 state machines, the `want_config` handshake sequence, the threading model, and the
-boot order. Diagrams are Mermaid (render natively on GitHub and in the IDE).
+boot order. 
 
-The firmware turns one Meshtastic node into a **6-phone BLE front end**. Each phone
+The firmware turns one Meshtastic node into a **N-phone BLE front end**. Each phone
 gets a connection that behaves like a standalone 1:1 Meshtastic link, while the proxy
 arbitrates the single shared UART link to the node.
 
 ---
 
-## 1. Module dependency graph
-
-Who calls/includes whom (`src/`). `upstream_session` deliberately has **no** compile
-dependency on `ble_gatt` — the per-phone replay is reached through a registered
-callback (dependency inversion).
-
-```mermaid
-flowchart TD
-    main["main.c<br/>boot order · ToRadio/FromRadio callbacks"]
-    ble["ble_gatt.c<br/>GATT server · per-phone state · replay"]
-    uart["uart_meshtastic.c<br/>UART1 Stream API · TX queue"]
-    router["router.c<br/>FromRadio dispatch"]
-    up["upstream_session.c<br/>boot want_config · state machine · keepalive"]
-    cache["config_cache.c<br/>packed burst cache · segmentation"]
-    proto["proto_handler.c<br/>nanopb decode/encode"]
-    proxyp["proxy_protocol.c<br/>DST_ID header (portnum 256)"]
-
-    main --> ble
-    main --> uart
-    main --> proto
-    main --> router
-    main --> up
-
-    router --> up
-    router --> ble
-    router --> proxyp
-    router --> proto
-
-    ble --> cache
-    ble --> proto
-    ble --> up
-
-    up --> cache
-    up --> uart
-    up --> proto
-
-    up -. "serve callback<br/>(set at boot, no static dep)" .-> ble
-
-    classDef new fill:#cfe8ff,stroke:#2b6cb0,color:#14213d;
-    class cache,up new;
-```
-
-- Pure / leaf modules (no intra-project deps): `proto_handler`, `proxy_protocol`,
-  `uart_meshtastic`, `config_cache`.
-- The dashed edge is the runtime callback `upstream_set_serve_cb(ble_gatt_replay_cached_burst)`
-  registered by `main` at boot — keeps the layering clean (upstream → ble_gatt only at runtime).
-
----
-
-## 2. Data flow (BLE ↔ UART)
+## 1. Data flow (BLE ↔ UART)
 
 ```mermaid
 flowchart LR
@@ -248,7 +199,7 @@ one wire.
   <img src="figs/UARTE-OP.svg" alt="nRF UARTE1 datapath: EasyDMA RX/TX buffers in RAM, RXDRDY→PPI→TIMER2 byte counter, and the k_timer 2 ms idle timeout that emits UART_RX_RDY" width="70%">
 </p>
 
-<p align="center"><em>Figure 2 — nRF UARTE1 datapath. <strong>RX:</strong> bytes flow RXD line → RX FIFO → EasyDMA → the RX buffer in RAM; each received byte pulses <code>RXDRDY</code>, routed by <strong>PPI</strong> to <strong>TIMER2</strong> in counter mode (it counts <em>bytes</em>, not time). A software <code>k_timer</code> polls that count every 400 µs and, after <strong>2 ms</strong> with no new byte, emits <code>UART_RX_RDY</code> to hand the buffered <code>FromRadio</code> bytes to the app. <strong>TX</strong> mirrors it: <code>ToRadio</code> bytes in the TX buffer → EasyDMA → TX line.</em></p>
+<p align="center"><em>Figure 2 — nRF UARTE1 datapath. Each received byte pulses <code>RXDRDY</code>, routed by <strong>PPI</strong> to <strong>TIMER2</strong> in counter mode (it counts <em>bytes</em>, not time). A software <code>k_timer</code> polls that count every 400 µs and, after <strong>2 ms</strong> with no new byte, emits <code>UART_RX_RDY</code> to hand the buffered <code>FromRadio</code> bytes to the app.
 
 **nordic-side driver (`uart_meshtastic.c`).** RX and TX both use the Zephyr **async API with
 EasyDMA**, so the CPU is never in the per-byte path:
@@ -270,13 +221,13 @@ scheduled relative to the BT RX thread.
 
 ---
 
-## 3. State machines
+## 3. System Operation
 
-### 3a. State machines — upstream session + per-phone connection (unified)
+### 3a. State machines (Transient) — upstream session + per-phone connection (unified)
 
 The two state machines that drive onboarding, shown together: the **global upstream
 session** (`upstream_session.c`, one instance — `BOOT → FETCHING → CACHE_READY → LIVE`)
-and the **per-phone connection** machine (`ble_gatt.c`, one per BLE connection, up to 6 —
+and the **per-phone connection** machine (`ble_gatt.c`, one per BLE connection, up to N —
 `CONNECTED → AWAIT_WANT_CONFIG → {PENDING} → REPLAYING → ACTIVE`).
 
 <p align="center">
@@ -297,34 +248,26 @@ that sent `want_config_id = P` is specifically waiting for a `config_complete_id
 therefore never replays the cached terminator (it carries the proxy's boot nonce `R`); it
 **synthesizes** a fresh one carrying each phone's own `P` (see §4).
 
-### 3b. System lifecycle — transient vs steady state
-
-The whole system goes through a **transient** phase (boot configuration + connection
-setup) before settling into a **steady** phase where text messaging flows naturally.
-§3a is the precise per-machine view; this is the system-level overview.
-
-- **TRANSIENT** = the proxy fetches the node's config once, then each phone connects and
-  runs its `want_config` handshake (config round `69420` → node-DB round `69421`). These
-  are state-changing, one-time-per-(boot / connection) flows — the detailed mechanics live
-  in the §3a machines.
-- **STEADY** = `OPERATIONAL (STATE PHONE_ACTIVE)`: no state changes — the self-loops are the recurring,
-  event-driven message flows (UART RX callbacks delivering text/telemetry → routed BLE
-  notifications; phone writes → UART → mesh; liveness). This is the "stationary" regime.
-
-<p align="center">
-  <img src="figs/steady-state-arch.svg" alt="Steady-state operational message flows" width="65%">
-</p>
-
-<p align="center"><em>Figure 3b — the steady (<code>OPERATIONAL</code>) regime: recurring, event-driven flows once the cache is LIVE and the phone is ACTIVE. (TODO: this figure still omits the broadcast path — node FromRadio fanned out to all connected phones.)</em></p>
-
 Notes:
 - A phone connecting **before** the cache is ready waits as `PENDING` (§3a) inside the
   transient phase, then onboards automatically once the upstream reaches LIVE.
 - Concurrency: the upstream session is global (one); the per-phone machine is
-  per-connection (up to 6); they overlap in time. The happy-path ordering holds because a
+  per-connection (up to N); they overlap in time. The happy-path ordering holds because a
   real phone simply can't finish onboarding until the cache exists.
 - Leaving STEADY → TRANSIENT is per-phone and local: one phone re-running `want_config`
   (or reconnecting) re-enters its onboarding without disturbing the others or the node.
+
+### 3b. System lifecycle (Steady state)
+
+The whole system goes through a no state changes — the self-loops are the recurring,
+  event-driven message flows (UART RX callbacks delivering text/telemetry → routed BLE
+  notifications; phone writes → UART → mesh; liveness). This is the "stationary" regime.
+
+<p align="center">
+  <img src="figs/steady-state-arch.svg" alt="Steady-state operational message flows" width="75%">
+</p>
+
+<p align="center"><em>Figure 3b — the steady (<code>OPERATIONAL</code>) regime: recurring, event-driven flows once the cache is LIVE and the phone is ACTIVE. (TODO: this figure still omits the broadcast path — node FromRadio fanned out to all connected phones.)</em></p>
 
 ---
 

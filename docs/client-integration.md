@@ -1,7 +1,7 @@
 # Client Integration Guide — Android / iOS apps ↔ Meshtastic BLE Proxy
 
 > Audience: developers of the phone apps that connect to the nRF52840 proxy.
-> Companion to [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+> Companion to [`architecture.md`](./architecture.md).
 
 The proxy presents itself as a **Meshtastic-compatible BLE peripheral** that
 multiplexes up to 6 phones onto **one** physical Meshtastic node over UART. It
@@ -50,7 +50,7 @@ what it does against a real node:
 
 The proxy serves config from a **boot-time cache**: node metrics (battery,
 utilization, last_heard, position) may be slightly stale at connect, then refresh
-from live telemetry/position packets. See `ARCHITECTURE.md` for the full lifecycle.
+from live telemetry/position packets. See `architecture.md` for the full lifecycle.
 
 ---
 
@@ -138,6 +138,6 @@ app-side logic.
 - LOGRADIO is a stub in v1.0.
 
 ## 6. References (this repo)
-- Architecture + diagrams: [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md)
+- Architecture + diagrams: [`docs/architecture.md`](./architecture.md)
 - Proxy header format & constants: `src/proxy_protocol.h`
 - GATT server + routing: `src/ble_gatt.c`, `src/router.c`

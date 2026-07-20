@@ -34,7 +34,7 @@ LOG_MODULE_REGISTER(uart_meshtastic, LOG_LEVEL_DBG);
 
 #define UART_DMA_BUF_SIZE    256U   /* DMA double-buffer size per buffer        */
 #define RING_BUF_SIZE        1024U  /* RX ring buffer (power of 2)              */
-#define UART_RX_TIMEOUT_US   2000U  /* Inter-byte timeout before UART_RX_RDY   */
+#define UART_RX_TIMEOUT_US   2000U  /* Inter-byte timeout before UART_RX_RDY    */
 #define TX_QUEUE_DEPTH       4U     /* Max queued outbound ToRadio packets      */
 
 /*

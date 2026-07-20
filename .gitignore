@@ -27,3 +27,6 @@ readings/
 # Local capture/diagnosis logs (node + proxy traces) — kept local, never committed
 txrx.txt
 rxtx.txt
+
+# For testing proxy in PUC Campus San Joaquín
+tools/meshtastic/puc_campus/

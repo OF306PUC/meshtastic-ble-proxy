@@ -78,7 +78,7 @@ Set the BLE device name in `prj.conf` before flashing — it must match
   and maintains a `proxy_id → nodenum` directory. Unregistered `DST_ID`s fall back to
   broadcast.
 
-**→ Full integration guide for app teams: [`docs/CLIENT-INTEGRATION.md`](docs/CLIENT-INTEGRATION.md)**
+**→ Full integration guide for app teams: [`docs/client-integration.md`](docs/client-integration.md)**
 (GATT UUIDs, connection lifecycle, wire format, the four app changes, gotchas).
 
 ## Status
