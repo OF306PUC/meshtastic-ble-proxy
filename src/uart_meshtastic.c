@@ -172,7 +172,6 @@ static void rx_process_byte(uint8_t byte)
     case RX_WAIT_PAYLOAD:
         rx_sm.payload[rx_sm.received_len++] = byte;
         if (rx_sm.received_len == rx_sm.expected_len) {
-            ROUTE_TRACE("ROUTE DN  node->uart: frame %d B from node", rx_sm.received_len);
             if (fromradio_cb) {
                 fromradio_cb(rx_sm.payload, rx_sm.received_len);
             }
@@ -228,8 +227,6 @@ static void tx_work_handler(struct k_work *work)
         tx_in_progress = false;
         /* Drop this entry and try the next one. */
         k_work_submit(work);
-    } else {
-        ROUTE_TRACE("ROUTE UP  uart->node: TX %u B to node", (unsigned)entry.len);
     }
 }
 

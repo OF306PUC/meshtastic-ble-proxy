@@ -1,6 +1,8 @@
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
+#include <inttypes.h>
 #include "ble_gatt.h"
 #include "uart_meshtastic.h"
 #include "proto_handler.h"
@@ -83,26 +85,24 @@ static void on_toradio_ble(struct bt_conn *conn, const uint8_t *data, uint16_t l
 
     if (ti.has_heartbeat) {
         /* Absorbed locally: reply a synthesized queueStatus to keep the
-         * phone's liveness timer alive. NEVER forwarded to UART — the node's
-         * serial link is kept alive by upstream_session's own keepalive. */
+         * phone's liveness timer alive. */
         ble_gatt_reply_queuestatus(conn);
         return;
     }
-
+#if IS_ENABLED(CONFIG_MESHTASTIC_ROUTE_TRACE)
+    /* TESTING ONLY: Assumes proxy-framed payload with 4-byte IDs. */
+    if (ti.is_packet && ti.portnum == PROXY_PORTNUM && ti.payload_len >= PROXY_HEADER_SIZE) {
+        ROUTE_TRACE("ROUTE UP  hdr=[%02x][0x%08" PRIx32 "][0x%08" PRIx32 "] content='%.*s'",
+                    ti.payload_bytes[PROXY_OFF_VERSION],
+                    sys_get_be32(&ti.payload_bytes[PROXY_OFF_SRC]),
+                    sys_get_be32(&ti.payload_bytes[PROXY_OFF_DST]),
+                    (int)(ti.payload_len - PROXY_HEADER_SIZE),
+                    (const char *)&ti.payload_bytes[PROXY_OFF_CONTENT]);
+        ROUTE_TRACE_HEXDUMP(ti.payload_bytes, ti.payload_len, "ROUTE UP payload");
+    }
+#endif 
     /* Real packet → forward to the node, and push the upstream keepalive out
      * the keepalive only fires after a stretch of true silence. */
-    ROUTE_TRACE("ROUTE UP  ble->node: ToRadio %d B from conn %p -> UART", len, (void *)conn);
-    ROUTE_TRACE_HEXDUMP(data, len, "ROUTE UP payload");
-#if IS_ENABLED(CONFIG_MESHTASTIC_ROUTE_TRACE)
-    if (ti.is_packet && ti.portnum == PROXY_PORTNUM) {
-        struct proxy_header hdr;
-        if (proxy_header_parse(ti.payload_bytes, ti.payload_len, &hdr)) {
-            char wire[PROXY_HEADER_STR_SIZE];
-            ROUTE_TRACE("ROUTE UP  wire: %s",
-                        proxy_header_to_str(&hdr, wire, sizeof(wire)));
-        }
-    }
-#endif
     int err = uart_meshtastic_tx(data, len);
     if (err == -ENOMEM) {
         LOG_WRN("TX queue full — ToRadio from conn %p dropped", (void *)conn);

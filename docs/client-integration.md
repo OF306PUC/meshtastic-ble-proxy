@@ -24,7 +24,7 @@ Service UUID `6ba1b218-15a8-461f-9fa8-5dcae273eafd` (same as stock Meshtastic).
 | **FROMRADIO** | `2c55e69e-4993-11ed-b878-0242ac120002` | **read** | drain repeatedly until a 0-length read (one `FromRadio` per read) |
 | **TORADIO** | `f75c76d2-129e-4dad-a1dd-7866124401e7` | **write** / write-no-rsp | write one `ToRadio` |
 | **LOGRADIO** | `5a3d6e49-06e6-4423-9944-e9de8cdf9547` | read, notify | **stub** in v1.0 (returns empty) |
-| **NODE_REG** *(custom)* | `12345678-0001-0001-0001-000000000001` | **write** (16 bytes) | router only — register this phone's `proxy_id`. Ignored by the stock app. |
+| **NODE_REG** *(custom)* | `12345678-0001-0001-0001-000000000001` | **write** (4 bytes) | router only — register this phone's `proxy_id`. Ignored by the stock app. |
 
 Note: there is **no BLE Battery Service** (`0x180F`/`0x2A19`). Battery/metrics
 arrive via protobuf (`NodeInfo.device_metrics` + `Telemetry` portnum 67), not BLE.
@@ -85,22 +85,32 @@ Carried inside `MeshPacket.decoded.payload` when `portnum == 256`:
 ```
 offset  field      size
   0     VERSION    1     = 0x01
-  1     SRC_ID     16    sender proxy_id    (e.g. E.164 phone number / UUID, null-padded)
- 17     DST_ID     16    receiver proxy_id
- 33     content    N     payload, N ≤ 117 bytes
+  1     SRC_ID     4     sender proxy_id
+  5     DST_ID     4     receiver proxy_id
+  9     content    N     payload, N ≤ 141 bytes
 ```
-Header = 33 bytes. Practical content max = **117 bytes** (Meshtastic payload
-limit). `proxy_id` = 16 bytes, null-padded. (Defined in `src/proxy_protocol.h`.)
+Header = 9 bytes. Practical content max = **141 bytes** (Meshtastic payload
+limit). `proxy_id` = **4 bytes** = a little-endian `uint32`. (Defined in
+`src/proxy_protocol.h` as `PROXY_ID_SIZE`.)
+
+> The current build carries the phone identity as a 4-byte `uint32` (e.g. a
+> national phone number without country code — the proxy logs it as
+> `+56<uint32>`). The 16-byte UUID form is a possible future format: bump
+> `PROXY_ID_SIZE` to 16 and the header/offsets/content-max recompute from it, and
+> the UUID string renderers in `src/proxy_protocol.c` are kept for that case.
+> Both ends must agree on `PROXY_ID_SIZE` — it defines the wire layout.
 
 ### 4.2 The four app changes
 
 **(1) Register on connect — write NODE_REG.**
-After connecting, write your 16-byte `proxy_id` to the NODE_REG characteristic.
-Without it the proxy cannot map `DST_ID → connection` and falls back to
-broadcast. (The stock app simply never writes it → broadcast.)
+After connecting, write your 4-byte `proxy_id` (LE `uint32`) to the NODE_REG
+characteristic. A write of any other length is rejected
+(`BT_ATT_ERR_INVALID_ATTRIBUTE_LEN`). Without it the proxy cannot map
+`DST_ID → connection` and falls back to broadcast. (The stock app simply never
+writes it → broadcast.)
 
 **(2) Send — frame + portnum 256.**
-Build the 33-byte header + content, then send a normal Meshtastic
+Build the 9-byte header + content, then send a normal Meshtastic
 `ToRadio{ MeshPacket{ to=<dest nodenum>, decoded.portnum=256, payload=<header+content> } }`.
 The app does the framing; the proxy forwards it verbatim to UART → node → mesh.
 
@@ -130,7 +140,7 @@ app-side logic.
 ---
 
 ## 5. Constraints / gotchas
-- `proxy_id`: 16 bytes; content ≤ 117 bytes per message.
+- `proxy_id`: 4 bytes (LE `uint32`); content ≤ 141 bytes per message.
 - Heartbeat nonce ≠ 1; want_config special nonces 69420 / 69421.
 - FROMRADIO is **read-only** (do NOT expect notifications on it — only FROMNUM
   notifies). Drain on FROMNUM notify and after each write.

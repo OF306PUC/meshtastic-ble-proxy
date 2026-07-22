@@ -1,15 +1,17 @@
 import argparse
-import subprocess
-import time
-import secrets
 import base64
-import os
+import subprocess
 import sys
+import time
+from pathlib import Path
 
 import meshtastic.serial_interface
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import param_node as node_params
+# All tool scripts live side-by-side in this directory; make sibling modules
+# (configure_params, radio_config) importable when run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import configure_params as node_params  # noqa: E402
 
 MAX_RETRIES = 3
 RETRY_DELAY = 10  # seconds to wait before retrying
@@ -22,6 +24,18 @@ RETRYABLE_ERRORS = [
     "OS Error",
     "serial device",
     "write failed",
+]
+
+# Channels this node must join: telemetry (primary) + messaging, shared
+# mesh-wide via common/radio_config.py. PSKs come from .env, same source of
+# truth as node/ and gateway/.
+CHANNELS = [
+    (node_params.CHANNEL_TELEMETRY_IDX,
+     node_params.CHANNEL_TELEMETRY_NAME,
+     node_params.CHANNEL_TELEMETRY_PSK_B64),
+    (node_params.CHANNEL_MSG_IDX,
+     node_params.CHANNEL_MSG_NAME,
+     node_params.CHANNEL_MSG_PSK_B64),
 ]
 
 
@@ -54,54 +68,42 @@ def run(cmd, retries=MAX_RETRIES) -> bool:
     return False
 
 
-def load_or_generate_psks(psk_file: str) -> list:
-    """Load channel PSKs from `psk_file`, or generate and persist them.
+def get_config_value(mesh_argv, key: str) -> str:
+    """Read one config value back from the node via `meshtastic --get <key>`.
 
-    Persisting means every node provisioned from the same file shares keys.
-    The file holds secret key material, so it is created 0o600 and is
-    git-ignored. Returns a list of raw 32-byte PSKs.
+    Returns the CLI's stdout (stripped) so callers can substring-match the
+    expected value; returns '' if the read fails.
     """
-    if os.path.exists(psk_file):
-        psks_bytes = []
-        with open(psk_file, "r") as f:
-            for lineno, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue  # tolerate blank / trailing lines
-                if ": " not in line:
-                    print(f"WARNING: {psk_file}:{lineno} malformed, skipping: {line!r}")
-                    continue
-                try:
-                    psks_bytes.append(base64.b64decode(line.split(": ", 1)[1]))
-                except Exception as exc:
-                    print(f"WARNING: {psk_file}:{lineno} bad base64, skipping: {exc}")
-        print(f"PSKs loaded from {psk_file} ({len(psks_bytes)} keys)")
-        if len(psks_bytes) != node_params.NUM_CHANNELS:
-            print(
-                f"WARNING: loaded {len(psks_bytes)} PSKs but NUM_CHANNELS="
-                f"{node_params.NUM_CHANNELS}; channels without a key will be skipped."
-            )
-        return psks_bytes
+    result = subprocess.run(mesh_argv + ["--get", key], capture_output=True, text=True)
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
 
-    psks_bytes = [secrets.token_bytes(32) for _ in range(node_params.NUM_CHANNELS)]
-    # Create restricted (0o600) up front so the secrets are never briefly
-    # world-readable, then chmod again to defeat a permissive umask.
-    fd = os.open(psk_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        for ch_idx, psk_bytes in enumerate(psks_bytes):
-            f.write(
-                f"{node_params.CHANNEL_BASE_NAME}{ch_idx}: "
-                f"{base64.b64encode(psk_bytes).decode()}\n"
-            )
-    os.chmod(psk_file, 0o600)
-    print(f"PSKs generated and written to {psk_file} (mode 0600)")
-    return psks_bytes
+
+def decode_psk(psk_b64: str) -> bytes:
+    """Decode a channel PSK as stored in .env: 'base64:<key>' or bare base64."""
+    if psk_b64.startswith("base64:"):
+        psk_b64 = psk_b64[len("base64:"):]
+    return base64.b64decode(psk_b64)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Configure a Meshtastic node.")
+    parser = argparse.ArgumentParser(description="Configure the Meshtastic node attached to the BLE proxy.")
     parser.add_argument("--port", required=True, help="Serial port of the device (e.g. /dev/ttyUSB0)")
     args = parser.parse_args()
+
+    # Per-proxy settings live in configure_params.py (edit before flashing).
+    hop_limit = node_params.HOP_LIMIT
+    device_role = node_params.DEVICE_ROLE
+
+    # radio_config already enforces the telemetry PSK; the proxy node also
+    # needs the messaging channel key, so fail early if it is missing.
+    if not node_params.CHANNEL_MSG_PSK_B64:
+        print(
+            "ERROR: LORA_MSG_CHANNEL_PSK is not set. Copy .env.example to .env "
+            "and set the messaging-channel PSK (shared mesh-wide)."
+        )
+        return 2
 
     # Base argv for every meshtastic CLI invocation (no shell → no quoting issues).
     mesh = ["meshtastic", "--port", args.port]
@@ -113,48 +115,58 @@ def main() -> int:
         if not run(cmd):
             failures.append(label)
 
-    print(f"Starting node configuration on {args.port}...")
+    print(f"Starting proxy-node configuration (role={device_role}, hop_limit={hop_limit}) on {args.port}...")
 
-    # LoRa config: region, preset, hop limit
+    # LoRa config: region, preset, hop limit. sx126x_rx_boosted_gain is
+    # honoured only by SX126x radios; on an SX127x T-Beam it is stored but
+    # ignored (harmless), so we set it mesh-wide from radio_config.
     step("LoRa (region/preset/hop_limit)", mesh + [
         "--set", "lora.region", node_params.LORA_REGION,
         "--set", "lora.modem_preset", node_params.LORA_PRESET,
-        "--set", "lora.hop_limit", str(node_params.HOP_LIMIT),
+        "--set", "lora.hop_limit", str(hop_limit),
+        "--set", "lora.sx126x_rx_boosted_gain", str(node_params.SX126X_RX_BOOSTED_GAIN).lower(),
     ])
 
-    # Device config: rebroadcast mode and role (role varies by node position)
-    step("device (rebroadcast/role)", mesh + [
+    # Device config: rebroadcast mode and role — set in SEPARATE invocations.
+    # A role change can trigger a reboot, and when both were sent in one command
+    # the rebroadcast_mode write was dropped and never persisted. Set + verify
+    # rebroadcast first, then role.
+    step("device rebroadcast_mode", mesh + [
         "--set", "device.rebroadcast_mode", node_params.REBROADCAST_MODE,
-        "--set", "device.role", node_params.DEVICE_ROLE_CLIENT,
     ])
+    actual = get_config_value(mesh, "device.rebroadcast_mode")
+    if node_params.REBROADCAST_MODE.lower() not in actual.lower():
+        print(f"WARNING: device.rebroadcast_mode did not persist "
+              f"(expected {node_params.REBROADCAST_MODE}, read '{actual or 'unknown'}').")
+        failures.append("device.rebroadcast_mode (verify)")
+    else:
+        print(f"Verified device.rebroadcast_mode = {node_params.REBROADCAST_MODE}")
+    step("device role", mesh + ["--set", "device.role", device_role])
 
-    # Bluetooth config
+    # Bluetooth config: off — the nRF52840 proxy serves the BLE side.
     ble = str(node_params.BLUETOOTH_ENABLE).lower()
     step("bluetooth", mesh + ["--set", "bluetooth.enabled", ble])
 
-    # Load PSKs from file if it exists, otherwise generate and save them.
-    # This ensures every node gets the same keys across separate runs.
-    psk_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_psks.txt")
-    psks_bytes = load_or_generate_psks(psk_file)
-
-    # Channel 0 (primary) already exists — rename it.
-    # Channels 1+ must be created with --ch-add; the flag also sets the name and
-    # makes subsequent --ch-set calls target the new channel automatically.
-    step("channel 0 rename", mesh + [
-        "--ch-index", "0", "--ch-set", "name", f"{node_params.CHANNEL_BASE_NAME}0",
+    # Channel 0 (primary) already exists — rename it to the telemetry channel.
+    # Channel 1 (messaging) must be created with --ch-add; re-running after it
+    # exists makes the step fail, which is reported but harmless.
+    step(f"channel {node_params.CHANNEL_TELEMETRY_IDX} rename", mesh + [
+        "--ch-index", str(node_params.CHANNEL_TELEMETRY_IDX),
+        "--ch-set", "name", node_params.CHANNEL_TELEMETRY_NAME,
     ])
-    for ch_idx in range(1, node_params.NUM_CHANNELS):
-        step(f"channel {ch_idx} add", mesh + ["--ch-add", f"{node_params.CHANNEL_BASE_NAME}{ch_idx}"])
+    step(f"channel {node_params.CHANNEL_MSG_IDX} add", mesh + [
+        "--ch-add", node_params.CHANNEL_MSG_NAME,
+    ])
 
     # Set PSKs via Python API — the CLI assigns the value as a str to a bytes
     # field, causing "expected bytes, str found". The API accepts bytes directly.
     try:
         iface = meshtastic.serial_interface.SerialInterface(devPath=args.port)
         try:
-            for ch_idx, psk_bytes in enumerate(psks_bytes):
-                iface.localNode.channels[ch_idx].settings.psk = psk_bytes
+            for ch_idx, ch_name, psk_b64 in CHANNELS:
+                iface.localNode.channels[ch_idx].settings.psk = decode_psk(psk_b64)
                 iface.localNode.writeChannel(ch_idx)
-                print(f"PSK set for channel {ch_idx}.")
+                print(f"PSK set for channel {ch_idx} ({ch_name}).")
                 time.sleep(5)
         finally:
             iface.close()
@@ -172,7 +184,7 @@ def main() -> int:
     else:
         step("telemetry", mesh + ["--set", "telemetry.device_telemetry_enabled", dev_meas])
 
-    # Serial module config
+    # Serial module config: Stream API on UART1 → the BLE proxy drives the node.
     serial_en = str(node_params.SERIAL_MODULE_ENABLE).lower()
     if node_params.SERIAL_MODULE_ENABLE:
         step("serial module", mesh + [

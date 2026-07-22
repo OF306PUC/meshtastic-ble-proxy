@@ -1,10 +1,14 @@
-# `tools/meshtastic/` — node provisioning & capture scripts
+# `tools/meshtastic/` — node provisioning & inspection scripts
 
-Host-side Python utilities for the proof-of-concept: provisioning the LILYGO
-T-Beam Meshtastic nodes (channels, LoRa region, serial module, etc.) and
-capturing a node's `want_config` burst over USB serial. These talk to a node
-over **direct USB serial** — they are independent of the nRF52840 BLE proxy
-firmware.
+Host-side Python utilities for provisioning the LILYGO T-Beam Meshtastic nodes
+that hang off the nRF52840 BLE proxy (channels, LoRa region, serial module,
+telemetry/GPS intervals) and for inspecting a node's health. These talk to a
+node over **direct USB serial** — they are independent of the nRF52840 BLE
+proxy firmware.
+
+> **Flooding is intentional.** The telemetry and position broadcast intervals in
+> `configure_params.py` are deliberately low (30 s / 60 s) to stress/flood the
+> mesh for testing. A production deployment would raise them (~900 s / ~1800 s).
 
 ## Setup
 
@@ -14,69 +18,60 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` pins the full environment; the essentials are
-[`meshtastic`](https://pypi.org/project/meshtastic/) (CLI + Python API) and
-`pyserial`. `fetch_node_config.py` only strictly needs `pyserial` (it speaks the
-Stream API directly); `meshtastic` is an optional enhancement there.
+Essentials are [`meshtastic`](https://pypi.org/project/meshtastic/) (CLI +
+Python API) and `pyserial`; `requirements.txt` pins the full environment.
+
+### Secrets — `.env`
+
+Channel PSKs (base64) are read from `.env` **in this directory**. It is
+**git-ignored** — never commit it. Set both keys, identical on every node in the
+mesh:
+
+```sh
+LORA_TELEMETRY_CHANNEL_PSK=base64:...
+LORA_MSG_CHANNEL_PSK=base64:...
+```
 
 ## Scripts
 
-### `param_node.py` — central node parameters (edit this first)
+### `radio_config.py` — mesh-wide radio settings (single source of truth)
 
-Plain constants module imported by `configure_node.py`. Set per-node values here
-before configuring: channel base name / count, LoRa region & preset,
-Bluetooth, telemetry, GPS, role, and the **serial module** settings.
+Channel indices/names, LoRa region & preset, rebroadcast mode, and the PSKs
+(loaded from `.env`). Imported by the others so settings can't drift. Channel 0
+= telemetry (`telCPS_RTC`), channel 1 = messaging (`msgPUC_NET`).
 
-> **Relevant to the proxy wiring:** `SERIAL_MODULE_MODE = "PROTO"` with
-> `SERIAL_MODULE_TXD = 15` / `SERIAL_MODULE_RXD = 35` routes the node's
-> Stream-API protobuf traffic onto ESP32 `UART_DEV(1)` (GPIO15 TX / GPIO35 RX) —
-> this is the UART link the nRF52840 proxy attaches to (see `docs/HARDWARE.md`).
-> `HOP_LIMIT` is derived per node from `REQUIRED_HOPS_TO_GATEWAY`.
+### `configure_params.py` — proxy-node parameters (edit before configuring)
 
-### `configure_node.py` — apply the parameters to a node
+Constants for the proxy-attached node: Bluetooth off (the nRF52840 serves BLE),
+telemetry/GPS intervals, and the **serial module** (`PROTO` mode on ESP32
+`UART_DEV(1)`, GPIO15 TX / GPIO35 RX — the UART link the proxy attaches to).
+Re-exports the shared radio settings from `radio_config.py`.
+
+### `configure.py` — apply the config to a node, then reboot
 
 Drives the `meshtastic` CLI (and the Python API for PSKs) to write the full
-config from `param_node.py`, then reboots the node. Runnable from any directory
-(it adds its own location to `sys.path` so `import param_node` resolves):
+config, verifies `rebroadcast_mode` persisted, and reboots. `DEVICE_ROLE` and
+`HOP_LIMIT` are set in `configure_params.py` (edit before flashing each board).
 
 ```sh
-python3 tools/meshtastic/configure_node.py --port /dev/ttyUSB0
+python3 tools/meshtastic/configure.py --port /dev/ttyUSB0
 ```
 
-What it does, in order: LoRa (region/preset/hop_limit) → device
-(rebroadcast/role) → Bluetooth → channels (rename ch0, add ch1+) → **PSKs** →
-telemetry → serial module → GPS → reboot. Transient serial errors are retried
-(`MAX_RETRIES`).
+Order: LoRa (region/preset/hop_limit) → device (rebroadcast + verify, then role)
+→ Bluetooth → channels (rename ch0, add ch1) → **PSKs** → telemetry → serial
+module → GPS → reboot. Transient serial errors are retried (`MAX_RETRIES`).
 
-> **🔑 Secrets — `channel_psks.txt`.** On first run the script generates one
-> 32-byte PSK per channel and writes them to `channel_psks.txt` **in this
-> directory**; later runs reload that file so every node in the mesh gets
-> identical keys. This file is **secret** and is **git-ignored** — never commit
-> it, and copy it between machines over a secure channel only. Delete it to
-> rotate keys (all nodes must then be re-provisioned).
+### `check_node_info.py` — inspect & health-check a node
 
-### `fetch_node_config.py` — capture the `want_config` burst
-
-Triggers the firmware's `want_config` handshake over USB serial and records the
-exact ordered `FromRadio` frames the node emits, terminated by the
-`config_complete_id` echoing the nonce we sent. Used to (a) verify the FETCHING
-ground truth and (b) size the firmware's `CONFIG_CACHE_ARENA_BYTES` from the
-real summed payload bytes.
+Reports local identity/telemetry, reads back every setting the configure script
+touches, and health-checks region/preset/rebroadcast/channels/PSKs against
+`radio_config.py`. Exit code 1 on any drift/mismatch, so it doubles as a smoke
+check. PSKs are compared but never printed.
 
 ```sh
-# Auto-detect port, random nonce:
-python3 fetch_node_config.py
-
-# Pin port + nonce and dump raw frames for replay into the host unit test:
-python3 fetch_node_config.py --port /dev/ttyACM0 --nonce 305419896 \
-    --dump .tmp/config_burst.hex
-
-# Longer timeout for a slow / busy node:
-python3 fetch_node_config.py --timeout 30
+python3 tools/meshtastic/check_node_info.py                 # auto-detect port
+python3 tools/meshtastic/check_node_info.py --port /dev/ttyACM0
 ```
-
-Exit codes: `0` success (matching `config_complete_id` seen), `1`
-timeout / no port / serial error, `2` bad arguments.
 
 ## Ports
 

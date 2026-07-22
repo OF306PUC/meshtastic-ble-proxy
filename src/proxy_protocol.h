@@ -14,18 +14,18 @@
  *
  * Wire format:
  *   [VERSION : 1 byte ]
- *   [SRC_ID  : 16 bytes]   sender   identifier (phone number, UUID, etc.)
- *   [DST_ID  : 16 bytes]   receiver identifier
- *   [content : N bytes ]   actual message payload
+ *   [SRC_ID  : 4 bytes]   sender   identifier (phone number, UUID, etc.)
+ *   [DST_ID  : 4 bytes]   receiver identifier
+ *   [content : N bytes ]  actual message payload
  *
- * Total header overhead: PROXY_HEADER_SIZE = 33 bytes.
+ * Total header overhead: PROXY_HEADER_SIZE = 9 bytes.
  *
- * Practical Meshtastic payload limit: ~150 bytes (after mesh headers).
- * Available for content: PROXY_CONTENT_MAX = 117 bytes.
+ * Practical Meshtastic payload limit: ~200 bytes (after mesh headers).
+ * Available for content: PROXY_CONTENT_MAX = 191 bytes.
  *
- * ID format (16 bytes, null-padded):
- *   - Phone number (E.164, max 15 ASCII digits + null)
- *   - Any opaque identifier ≤ 16 bytes
+ * ID format (4 bytes, null-padded):
+ *   - Phone number (e.g. 942756818)
+ *   - Any opaque identifier ≤ 4 bytes
  */
 
 /* Meshtastic portnum reserved for this proxy protocol.
@@ -33,20 +33,20 @@
 #define PROXY_PORTNUM           256U
 
 /* Practical Meshtastic Data.payload limit (conservative). */
-#define PROXY_PRACTICAL_MAX     150U
+#define PROXY_PRACTICAL_MAX     200U
 
 #define PROXY_VERSION           0x01U
-#define PROXY_ID_SIZE           16U
-#define PROXY_HEADER_SIZE       (1U + PROXY_ID_SIZE + PROXY_ID_SIZE)  /* 33 */
-#define PROXY_CONTENT_MAX       (PROXY_PRACTICAL_MAX - PROXY_HEADER_SIZE) /* 117 */
+#define PROXY_ID_SIZE           4U
+#define PROXY_HEADER_SIZE       (1U + PROXY_ID_SIZE + PROXY_ID_SIZE)        /* 9 */
+#define PROXY_CONTENT_MAX       (PROXY_PRACTICAL_MAX - PROXY_HEADER_SIZE)   /* 191 */
 
 /* Offsets within the raw payload buffer */
 #define PROXY_OFF_VERSION       0U
 #define PROXY_OFF_SRC           1U
-#define PROXY_OFF_DST           (PROXY_OFF_SRC + PROXY_ID_SIZE)        /* 17 */
-#define PROXY_OFF_CONTENT       PROXY_HEADER_SIZE                       /* 33 */
+#define PROXY_OFF_DST           (PROXY_OFF_SRC + PROXY_ID_SIZE) /* 5 */
+#define PROXY_OFF_CONTENT       PROXY_HEADER_SIZE               /* 9 */
 
-/* A 16-byte proxy identifier (phone number, UUID, etc., null-padded). */
+/* A 4-byte proxy identifier (phone number, UUID, etc., null-padded). */
 typedef struct {
     uint8_t bytes[PROXY_ID_SIZE];
 } proxy_id_t;
